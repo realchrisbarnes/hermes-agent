@@ -250,9 +250,16 @@ _SIG_BOUNDARY_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-# Lines that are nothing but a (possibly angle-bracketed) URL: logo/social
-# links that text rendering of HTML mail leaves behind. Pure noise in a quote.
-_BARE_URL_LINE_RE = re.compile(r"^\s*<?https?://\S+>?\s*$")
+# URL or email-address tokens (possibly angle-bracketed). Lines made of nothing
+# but these are logo/social/contact noise that text rendering of HTML mail
+# leaves behind. Pure noise in a quote.
+_URLISH_TOKEN_RE = re.compile(r"<?(?:https?://\S+|mailto:\S+|[\w.+-]+@[\w.-]+\.\w{2,})>?")
+
+
+def _line_is_link_noise(line: str) -> bool:
+    if not line.strip():
+        return False
+    return not _URLISH_TOKEN_RE.sub("", line).strip()
 
 
 def _sanitize_outgoing_style(text: str) -> str:
@@ -264,16 +271,21 @@ def _sanitize_outgoing_style(text: str) -> str:
     return out
 
 
-def _clean_message_text(body: str) -> str:
-    """The sender's NEW words only: stop at any prior quoted chain and at the
-    signature/legal/marketing footer; drop quoted lines and bare-URL lines."""
+def _clean_message_text(body: str, sender_name: str = "") -> str:
+    """The sender's NEW words only: stop at any prior quoted chain, at the
+    signature/legal/marketing footer, and at the sender's own name line (the
+    classic start of a contact-block signature); drop quoted lines and lines
+    that are only URLs/email addresses."""
+    sender_sig = (sender_name or "").strip().lower()
     kept: List[str] = []
-    for line in (body or "").splitlines():
+    for idx, line in enumerate((body or "").splitlines()):
         if _QUOTE_CHAIN_RE.match(line) or _SIG_BOUNDARY_RE.match(line):
+            break
+        if sender_sig and idx > 0 and line.strip().lower() == sender_sig:
             break
         if line.lstrip().startswith(">"):
             continue
-        if _BARE_URL_LINE_RE.match(line):
+        if _line_is_link_noise(line):
             continue
         kept.append(line.rstrip())
     out = "\n".join(kept)
@@ -286,7 +298,7 @@ def _quote_blocks(ctx: Dict[str, str]) -> Tuple[str, str]:
     context. Quotes only the sender's cleaned words, never their footer."""
     import html as _html
 
-    original = _clean_message_text(ctx.get("body", ""))
+    original = _clean_message_text(ctx.get("body", ""), ctx.get("from_name", ""))
     if not original:
         return "", ""
     if len(original) > 1500:
@@ -728,7 +740,7 @@ class EmailAdapter(BasePlatformAdapter):
         # The brain gets only the sender's NEW words: prior quoted chains and
         # signature/legal/marketing footers are noise that wastes context and
         # gets parroted back into replies as ugly fake "history".
-        brain_body = _clean_message_text(body) or body
+        brain_body = _clean_message_text(body, msg_data.get("sender_name") or "") or body
 
         # Build message text: include subject as context
         text = brain_body
