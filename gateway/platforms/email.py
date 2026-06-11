@@ -308,24 +308,29 @@ def _clean_message_text(body: str, sender_name: str = "") -> str:
     return out
 
 
-# Bella's outgoing signature (matches the autoreply lane's branding).
-SIGNATURE_TEXT = (
-    "Bella AI\n"
-    "Director of Strategic Operations, Millennial Insurance Group\n"
-    "bella@millennialinsgroup.com | millennialinsgroup.com\n"
-    "Sent with AI assistance."
+# Bella's NATIVE Gmail signature (owner rule: never invent a signature in
+# code). The cache file is maintained from Gmail settings by
+# bella-build/scripts/bella_signature.py; if it is missing, send unsigned.
+SIGNATURE_CACHE = os.getenv(
+    "BELLA_SIGNATURE_FILE",
+    "/Users/bella-ai/Bella/active/data/comms/bella-gmail-signature.json",
 )
-SIGNATURE_HTML = (
-    '<div style="margin-top:18px;color:#444;font-family:Arial,Helvetica,sans-serif;'
-    'font-size:13px;line-height:1.5">'
-    '<div style="font-weight:bold;color:#222">Bella AI</div>'
-    '<div>Director of Strategic Operations, Millennial Insurance Group</div>'
-    '<div><a href="mailto:bella@millennialinsgroup.com" style="color:#467886">'
-    'bella@millennialinsgroup.com</a> &nbsp;|&nbsp; '
-    '<a href="https://millennialinsgroup.com/" style="color:#467886">millennialinsgroup.com</a></div>'
-    '<div style="color:#999;font-size:11px;margin-top:4px">Sent with AI assistance.</div>'
-    '</div>'
-)
+_SIG_CACHE: Dict[str, Any] = {"mtime": 0.0, "html": "", "text": ""}
+
+
+def _native_signature() -> Tuple[str, str]:
+    """(text, html) of Bella's real Gmail signature; empty strings if absent."""
+    try:
+        mtime = os.path.getmtime(SIGNATURE_CACHE)
+        if mtime != _SIG_CACHE["mtime"]:
+            import json as _json
+            with open(SIGNATURE_CACHE, encoding="utf-8") as fh:
+                data = _json.load(fh)
+            _SIG_CACHE.update(mtime=mtime, html=str(data.get("html") or ""),
+                              text=str(data.get("text") or ""))
+    except Exception:
+        return "", ""
+    return _SIG_CACHE["text"], _SIG_CACHE["html"]
 
 # Cap on quoted history size, generous: full threads with signatures fit, but a
 # pathological chain cannot blow past SMTP size limits.
@@ -941,8 +946,10 @@ class EmailAdapter(BasePlatformAdapter):
         # content and is reproduced verbatim.
         body = _sanitize_outgoing_style(body)
         quote_plain, quote_html = _quote_blocks(ctx)
-        msg.attach(MIMEText(body + "\n\n" + SIGNATURE_TEXT + quote_plain, "plain", "utf-8"))
-        msg.attach(MIMEText(_html_body(body, SIGNATURE_HTML + quote_html), "html", "utf-8"))
+        sig_text, sig_html = _native_signature()
+        plain_sig = ("\n\n" + sig_text) if sig_text else ""
+        msg.attach(MIMEText(body + plain_sig + quote_plain, "plain", "utf-8"))
+        msg.attach(MIMEText(_html_body(body, sig_html + quote_html), "html", "utf-8"))
 
         smtp = self._connect_smtp()
         try:

@@ -665,7 +665,6 @@ class TestThreadContext(unittest.TestCase):
             )
             payload = send_call.get_payload()[0].get_payload(decode=True).decode("utf-8")
             self.assertTrue(payload.startswith("Here is the answer."))
-            self.assertIn("Bella AI", payload)  # signature between reply and quote
             self.assertIn("Pat User wrote:", payload)
             self.assertIn("> Original message that should be quoted cleanly.", payload)
 
@@ -1515,7 +1514,9 @@ class TestOutgoingHygiene(unittest.TestCase):
             "date": "Thu, 11 Jun 2026 10:21:45 -0400", "body": self.CHRIS_BODY,
         }
         sent = {}
-        with patch("smtplib.SMTP") as smtp_cls:
+        with patch("smtplib.SMTP") as smtp_cls, \
+                patch("gateway.platforms.email._native_signature",
+                      return_value=("NATIVE SIG TEXT", "<div>NATIVE SIG HTML</div>")):
             smtp = smtp_cls.return_value
             smtp.send_message.side_effect = lambda m: sent.update(msg=m)
             adapter._send_email("chris@test.com", "Got it — fixing the thread now.", None)
@@ -1529,8 +1530,8 @@ class TestOutgoingHygiene(unittest.TestCase):
         self.assertIn("Chris Barnes wrote:", parts["text/plain"])
         self.assertIn("<blockquote", parts["text/html"])
         self.assertIn("Confidentiality", parts["text/plain"])   # full history kept
-        self.assertIn("Bella AI", parts["text/plain"])          # Bella's signature present
-        self.assertIn("Director of Strategic Operations", parts["text/html"])
+        self.assertIn("NATIVE SIG TEXT", parts["text/plain"])    # native signature, not invented
+        self.assertIn("NATIVE SIG HTML", parts["text/html"])
 
     def test_control_notices_are_suppressed(self):
         import asyncio
