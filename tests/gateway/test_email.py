@@ -652,7 +652,8 @@ class TestThreadContext(unittest.TestCase):
             "body": "Original message that should be quoted cleanly.",
         }
 
-        with patch("smtplib.SMTP") as mock_smtp:
+        with patch("smtplib.SMTP") as mock_smtp, \
+                patch("gateway.platforms.email._native_signature", return_value=("", "")):
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
 
@@ -665,7 +666,7 @@ class TestThreadContext(unittest.TestCase):
             )
             payload = send_call.get_payload()[0].get_payload(decode=True).decode("utf-8")
             self.assertTrue(payload.startswith("Here is the answer."))
-            self.assertIn("Pat User wrote:", payload)
+            self.assertIn("From: Pat User", payload)
             self.assertIn("> Original message that should be quoted cleanly.", payload)
 
     def test_reply_does_not_double_re(self):
@@ -1483,11 +1484,13 @@ class TestOutgoingHygiene(unittest.TestCase):
         ctx = {"body": self.CHRIS_BODY, "from_name": "Chris Barnes",
                "from_addr": "chris@test.com", "date": "Thu, 11 Jun 2026 10:21:45 -0400"}
         plain, html = _quote_blocks(ctx)
-        self.assertIn("On Thu, 11 Jun 2026 10:21:45 -0400, Chris Barnes wrote:", plain)
+        self.assertIn("From: Chris Barnes <chris@test.com>", plain)
+        self.assertIn("Sent: Thu, 11 Jun 2026 10:21:45 -0400", plain)
         self.assertIn("> Review this email thread", plain)
         self.assertIn("Confidentiality", plain)       # signature/footer preserved
         self.assertIn("> Chris Barnes", plain)
         self.assertIn("<blockquote", html)
+        self.assertIn("<b>From:</b>", html)
         self.assertIn("TMH Group", html)
 
     def test_quote_blocks_prefer_original_html(self):
@@ -1526,8 +1529,8 @@ class TestOutgoingHygiene(unittest.TestCase):
                  for p in msg.get_payload()}
         self.assertIn("text/plain", parts)
         self.assertIn("text/html", parts)
-        self.assertNotIn("\u2014", parts["text/plain"].split("wrote:")[0])  # no-dash on Bella's words
-        self.assertIn("Chris Barnes wrote:", parts["text/plain"])
+        self.assertNotIn("\u2014", parts["text/plain"].split("From:")[0])  # no-dash on Bella's words
+        self.assertIn("From: Chris Barnes <chris@test.com>", parts["text/plain"])
         self.assertIn("<blockquote", parts["text/html"])
         self.assertIn("Confidentiality", parts["text/plain"])   # full history kept
         self.assertIn("NATIVE SIG TEXT", parts["text/plain"])    # native signature, not invented
