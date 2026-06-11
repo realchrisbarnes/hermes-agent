@@ -492,6 +492,198 @@ class TelegramAdapter(BasePlatformAdapter):
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
 
+    def _operational_issue_email_recipient(self) -> str:
+        """Return the operator email target for Telegram operational issues."""
+        return (
+            os.getenv("TELEGRAM_ISSUE_EMAIL_TO", "").strip()
+            or os.getenv("EMAIL_HOME_ADDRESS", "").strip()
+            or os.getenv("EMAIL_ADDRESS", "").strip()
+        )
+
+    def _send_operational_issue_email_via_google_oauth(self, subject: str, body: str) -> bool:
+        """Best-effort Gmail OAuth alert for Telegram operational issues.
+
+        This reuses the existing Google Workspace OAuth token used by Bella's
+        Gmail tooling instead of requiring SMTP credentials.  It never shells out
+        through a string, never logs the body, and only reports redacted stderr.
+        """
+        to_addr = self._operational_issue_email_recipient()
+        if not to_addr:
+            logger.info("[Telegram] Skipping issue email; no issue email recipient configured")
+            return False
+
+        script_override = os.getenv("HERMES_GOOGLE_WORKSPACE_SCRIPT", "").strip()
+        hermes_home = _Path(os.getenv("HERMES_HOME", "") or _Path.home() / ".hermes")
+        candidate_paths = [
+            _Path(script_override) if script_override else None,
+            hermes_home / "skills" / "productivity" / "google-workspace" / "scripts" / "google_api.py",
+            _Path(__file__).resolve().parents[2] / "skills" / "productivity" / "google-workspace" / "scripts" / "google_api.py",
+        ]
+        script_path = next((p for p in candidate_paths if p and p.exists()), None)
+        if not script_path:
+            logger.info("[Telegram] Skipping Gmail OAuth issue email; google-workspace script not found")
+            return False
+
+        cmd = [
+            sys.executable or "python3",
+            str(script_path),
+            "gmail",
+            "send",
+            "--to",
+            to_addr,
+            "--subject",
+            subject[:200],
+            "--body",
+            body,
+        ]
+        from_addr = os.getenv("EMAIL_ADDRESS", "").strip()
+        if from_addr:
+            cmd.extend(["--from", from_addr])
+
+        try:
+            import subprocess as _sp
+
+            completed = _sp.run(cmd, capture_output=True, text=True, timeout=45)
+            if completed.returncode == 0:
+                return True
+            stderr = (completed.stderr or completed.stdout or "").strip()
+            logger.warning(
+                "[Telegram] Gmail OAuth issue email failed with exit %s: %s",
+                completed.returncode,
+                stderr[:300] or "no output",
+            )
+            return False
+        except Exception as exc:
+            logger.warning("[Telegram] Gmail OAuth issue email send failed: %s", exc)
+            return False
+
+    def _send_operational_issue_email_via_smtp(self, subject: str, body: str) -> bool:
+        """Best-effort SMTP fallback for Telegram operational issues."""
+        to_addr = self._operational_issue_email_recipient()
+        from_addr = os.getenv("EMAIL_ADDRESS", "").strip()
+        password = os.getenv("EMAIL_PASSWORD", "")
+        smtp_host = os.getenv("EMAIL_SMTP_HOST", "").strip()
+        smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587") or "587")
+
+        if not (to_addr and from_addr and password and smtp_host):
+            logger.info("[Telegram] Skipping SMTP issue email; email SMTP env is incomplete")
+            return False
+
+        try:
+            import smtplib
+            import ssl
+            from email.message import EmailMessage
+
+            msg = EmailMessage()
+            msg["From"] = from_addr
+            msg["To"] = to_addr
+            msg["Subject"] = subject[:200]
+            msg.set_content(body)
+
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as smtp:
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.login(from_addr, password)
+                smtp.send_message(msg)
+            return True
+        except Exception as exc:
+            logger.warning("[Telegram] SMTP issue email send failed: %s", exc)
+            return False
+
+    def _send_operational_issue_email(self, subject: str, body: str) -> bool:
+        """Best-effort email alert for Telegram operational issues.
+
+        Prefer Bella's Gmail OAuth path because it already works without SMTP
+        app-password plumbing.  Keep SMTP as a compatibility fallback for older
+        deployments.  If neither path is configured, callers continue without
+        failing the Telegram gateway.
+        """
+        if self._send_operational_issue_email_via_google_oauth(subject, body):
+            return True
+        return self._send_operational_issue_email_via_smtp(subject, body)
+
+    async def _handle_new_chat_members(self, update: Any, context: Any) -> None:
+        """Email the operator when an allowlisted Telegram user is added to a chat."""
+        message = getattr(update, "message", None)
+        if not message:
+            return
+        chat = getattr(message, "chat", None)
+        chat_id = str(getattr(message, "chat_id", getattr(chat, "id", "")) or "")
+        chat_type = str(getattr(chat, "type", "group") or "group")
+        thread_id = getattr(message, "message_thread_id", None)
+        chat_title = getattr(chat, "title", None) or chat_id or "unknown chat"
+
+        for user in getattr(message, "new_chat_members", []) or []:
+            user_id = str(getattr(user, "id", "") or "")
+            if not user_id:
+                continue
+            user_name = (
+                getattr(user, "username", None)
+                or getattr(user, "first_name", None)
+                or user_id
+            )
+            if not self._is_callback_user_authorized(
+                user_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                thread_id=str(thread_id) if thread_id is not None else None,
+                user_name=str(user_name),
+            ):
+                continue
+
+            subject = "Telegram allowed user added"
+            body = (
+                "A Telegram user who is authorized for this gateway was added to a chat.\n\n"
+                f"Chat: {chat_title}\n"
+                f"Chat ID: {chat_id}\n"
+                f"Chat type: {chat_type}\n"
+                f"Thread ID: {thread_id if thread_id is not None else 'none'}\n"
+                f"User: {user_name}\n"
+                f"User ID: {user_id}\n\n"
+                "No secrets are included in this notification."
+            )
+            await asyncio.to_thread(self._send_operational_issue_email, subject, body)
+
+    def _process_bella_button_callback(self, data: str) -> tuple[str, bool]:
+        """Run Bella/DAVE button callback scripts and email issues best-effort."""
+        script_name = "bella_ask.py" if data.startswith("ask:") else "builder_dispatch.py"
+        script_path = _Path("/Users/bella-ai/Bella/active/bella-build/scripts") / script_name
+        try:
+            if not script_path.exists():
+                raise FileNotFoundError(str(script_path))
+
+            import subprocess as _sp
+
+            completed = _sp.run(
+                ["python3", str(script_path), "callback", data],
+                capture_output=True,
+                text=True,
+                timeout=25,
+            )
+            stdout = (completed.stdout or "").strip()
+            stderr = (completed.stderr or "").strip()
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"{script_name} exited {completed.returncode}: {stderr or stdout or 'no output'}"
+                )
+            try:
+                result = json.loads(stdout or "{}")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"{script_name} returned invalid JSON: {exc}") from exc
+            confirmation = str(result.get("confirmation") or "Done.")
+            return confirmation, False
+        except Exception as exc:
+            issue = f"Could not process Bella button callback: {exc}"
+            body = (
+                "Bella/DAVE hit an issue while processing a Telegram approval/build-fix button.\n\n"
+                f"Callback: {data}\n"
+                f"Script: {script_path}\n"
+                f"Issue: {exc}\n\n"
+                "No API keys, tokens, passwords, or secrets are included in this notification."
+            )
+            self._send_operational_issue_email("Telegram approval/build-fix button issue", body)
+            logger.warning("[Telegram] %s", issue)
+            return issue, True
+
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -1602,6 +1794,13 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            status_update_filters = getattr(filters, "StatusUpdate", None)
+            new_members_filter = getattr(status_update_filters, "NEW_CHAT_MEMBERS", None)
+            if new_members_filter is not None:
+                self._app.add_handler(TelegramMessageHandler(  # type: ignore[reportOptionalMemberAccess,reportCallIssue]
+                    new_members_filter,
+                    self._handle_new_chat_members
+                ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -3244,6 +3443,35 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Bella button callbacks: builder dispatch (bld_ok:/bld_no:) and
+        #     general button-asks (ask:<id>:<key>). Routed to Bella's stdlib CLIs. ---
+        if data.startswith(("bld_ok:", "bld_no:", "ask:")):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized.")
+                return
+            # Never break the gateway on a button press.  If Bella's local
+            # callback script fails, send Chris a best-effort email with the
+            # issue details and show a short, non-secret toast in Telegram.
+            confirmation, _had_issue = self._process_bella_button_callback(data)
+            await query.answer(text=confirmation[:200])
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            try:
+                # Visible acknowledgment in-chat (a toast alone is easy to miss).
+                await query.message.reply_text(f"✅ {confirmation}")
+            except Exception:
+                pass
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -3323,6 +3551,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 except Exception as exc:
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
+                    issue_body = (
+                        "Hermes hit an issue while resolving a Telegram command-approval button.\n\n"
+                        f"Choice: {choice}\n"
+                        f"Approval ID: {approval_id}\n"
+                        f"Chat ID: {query_chat_id}\n"
+                        f"User: {user_display}\n"
+                        f"Issue: {exc}\n\n"
+                        "No API keys, tokens, passwords, or secrets are included in this notification."
+                    )
+                    self._send_operational_issue_email(
+                        "Telegram command approval button issue",
+                        issue_body,
+                    )
                     count = 0
 
                 # Resume the typing indicator — paused when the approval was

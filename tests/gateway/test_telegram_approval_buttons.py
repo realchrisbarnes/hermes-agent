@@ -75,6 +75,104 @@ class _AuthRunner:
 
 
 # ===========================================================================
+# Operational issue notifications
+# ===========================================================================
+
+class TestTelegramOperationalNotifications:
+    """Test Telegram operational email notifications stay best-effort."""
+
+    @pytest.mark.asyncio
+    async def test_new_allowed_chat_member_sends_email(self):
+        adapter = _make_adapter()
+        adapter._send_operational_issue_email = MagicMock(return_value=True)
+
+        user = SimpleNamespace(id=111, username="mark", first_name="Mark")
+        chat = SimpleNamespace(id=-100, title="Chris, Bella and Mark", type="group")
+        message = SimpleNamespace(
+            chat=chat,
+            chat_id=-100,
+            message_thread_id=None,
+            new_chat_members=[user],
+        )
+        update = SimpleNamespace(message=message)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}, clear=False):
+            await adapter._handle_new_chat_members(update, MagicMock())
+
+        adapter._send_operational_issue_email.assert_called_once()
+        subject, body = adapter._send_operational_issue_email.call_args[0]
+        assert subject == "Telegram allowed user added"
+        assert "User ID: 111" in body
+        assert "No secrets" in body
+
+    @pytest.mark.asyncio
+    async def test_new_blocked_chat_member_does_not_email(self):
+        adapter = _make_adapter()
+        adapter._send_operational_issue_email = MagicMock(return_value=True)
+
+        user = SimpleNamespace(id=222, username="mallory", first_name="Mallory")
+        chat = SimpleNamespace(id=-100, title="Group", type="group")
+        message = SimpleNamespace(chat=chat, chat_id=-100, new_chat_members=[user])
+        update = SimpleNamespace(message=message)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111"}, clear=False):
+            await adapter._handle_new_chat_members(update, MagicMock())
+
+        adapter._send_operational_issue_email.assert_not_called()
+
+    def test_bella_button_failure_sends_issue_email(self):
+        adapter = _make_adapter()
+        adapter._send_operational_issue_email = MagicMock(return_value=True)
+
+        failed = SimpleNamespace(returncode=1, stdout="", stderr="boom")
+        with patch("subprocess.run", return_value=failed):
+            confirmation, had_issue = adapter._process_bella_button_callback("bld_ok:missing")
+
+        assert had_issue is True
+        assert "Could not process Bella button callback" in confirmation
+        adapter._send_operational_issue_email.assert_called_once()
+        subject, body = adapter._send_operational_issue_email.call_args[0]
+        assert subject == "Telegram approval/build-fix button issue"
+        assert "bld_ok:missing" in body
+        assert "No API keys" in body
+
+    def test_issue_email_prefers_google_oauth_script(self, tmp_path):
+        adapter = _make_adapter()
+        script = tmp_path / "google_api.py"
+        script.write_text("# test google api script\n")
+        completed = SimpleNamespace(returncode=0, stdout='{"status":"sent"}', stderr="")
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_GOOGLE_WORKSPACE_SCRIPT": str(script),
+                "TELEGRAM_ISSUE_EMAIL_TO": "ops@example.com",
+            },
+            clear=False,
+        ), patch("subprocess.run", return_value=completed) as run:
+            assert adapter._send_operational_issue_email("Subject", "Body") is True
+
+        cmd = run.call_args[0][0]
+        assert cmd[1] == str(script)
+        assert cmd[2:4] == ["gmail", "send"]
+        assert "--to" in cmd
+        assert cmd[cmd.index("--to") + 1] == "ops@example.com"
+        assert "--subject" in cmd
+        assert cmd[cmd.index("--subject") + 1] == "Subject"
+        assert "--body" in cmd
+        assert cmd[cmd.index("--body") + 1] == "Body"
+
+    def test_issue_email_falls_back_to_smtp_when_oauth_fails(self):
+        adapter = _make_adapter()
+        adapter._send_operational_issue_email_via_google_oauth = MagicMock(return_value=False)
+        adapter._send_operational_issue_email_via_smtp = MagicMock(return_value=True)
+
+        assert adapter._send_operational_issue_email("Subject", "Body") is True
+        adapter._send_operational_issue_email_via_google_oauth.assert_called_once_with("Subject", "Body")
+        adapter._send_operational_issue_email_via_smtp.assert_called_once_with("Subject", "Body")
+
+
+# ===========================================================================
 # send_exec_approval — inline keyboard buttons
 # ===========================================================================
 
