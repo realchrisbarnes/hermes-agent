@@ -603,6 +603,7 @@ class TestThreadContext(unittest.TestCase):
             )
             payload = send_call.get_payload()[0].get_payload(decode=True).decode("utf-8")
             self.assertTrue(payload.startswith("Here is the answer."))
+            self.assertIn("Bella AI", payload)  # signature between reply and quote
             self.assertIn("Pat User wrote:", payload)
             self.assertIn("> Original message that should be quoted cleanly.", payload)
 
@@ -1298,18 +1299,37 @@ class TestOutgoingHygiene(unittest.TestCase):
         self.assertNotIn("—", out)
         self.assertNotIn("–", out)
 
-    def test_quote_blocks_build_attribution_and_blockquote(self):
+    def test_quote_blocks_keep_full_history_including_signatures(self):
+        """Owner directive 2026-06-11: quoted history is FULL fidelity, like a
+        real mail client. Signatures and footers stay in the quote."""
         from gateway.platforms.email import _quote_blocks
         ctx = {"body": self.CHRIS_BODY, "from_name": "Chris Barnes",
                "from_addr": "chris@test.com", "date": "Thu, 11 Jun 2026 10:21:45 -0400"}
         plain, html = _quote_blocks(ctx)
         self.assertIn("On Thu, 11 Jun 2026 10:21:45 -0400, Chris Barnes wrote:", plain)
         self.assertIn("> Review this email thread", plain)
-        self.assertNotIn("Confidentiality", plain)
+        self.assertIn("Confidentiality", plain)       # signature/footer preserved
+        self.assertIn("> Chris Barnes", plain)
         self.assertIn("<blockquote", html)
-        self.assertNotIn("TMH Group", html)
+        self.assertIn("TMH Group", html)
 
-    def test_send_email_builds_multipart_alternative_with_clean_quote(self):
+    def test_quote_blocks_prefer_original_html(self):
+        from gateway.platforms.email import _quote_blocks
+        ctx = {"body": "hello", "from_name": "Chris", "from_addr": "c@x.com",
+               "date": "", "body_html": "<p>hello <b>world</b></p>"}
+        _, html = _quote_blocks(ctx)
+        self.assertIn("<p>hello <b>world</b></p>", html)
+
+    def test_quote_blocks_nest_existing_quotes(self):
+        from gateway.platforms.email import _quote_blocks
+        ctx = {"body": "newest\n> older reply\n> > oldest", "from_name": "Chris",
+               "from_addr": "c@x.com", "date": ""}
+        plain, _ = _quote_blocks(ctx)
+        self.assertIn("> newest", plain)
+        self.assertIn("> > older reply", plain)
+        self.assertIn("> > > oldest", plain)
+
+    def test_send_email_builds_multipart_alternative_with_full_quote_and_signature(self):
         adapter = _adapter_for_send()
         adapter._thread_context["chris@test.com"] = {
             "subject": "Test", "message_id": "<orig@x>", "references": "",
@@ -1327,10 +1347,12 @@ class TestOutgoingHygiene(unittest.TestCase):
                  for p in msg.get_payload()}
         self.assertIn("text/plain", parts)
         self.assertIn("text/html", parts)
-        self.assertNotIn("—", parts["text/plain"])          # no-dash rule
+        self.assertNotIn("\u2014", parts["text/plain"].split("wrote:")[0])  # no-dash on Bella's words
         self.assertIn("Chris Barnes wrote:", parts["text/plain"])
         self.assertIn("<blockquote", parts["text/html"])
-        self.assertNotIn("Confidentiality", parts["text/plain"])
+        self.assertIn("Confidentiality", parts["text/plain"])   # full history kept
+        self.assertIn("Bella AI", parts["text/plain"])          # Bella's signature present
+        self.assertIn("Director of Strategic Operations", parts["text/html"])
 
     def test_control_notices_are_suppressed(self):
         import asyncio
