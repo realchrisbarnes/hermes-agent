@@ -232,6 +232,92 @@ def _strip_html(html: str) -> str:
     return text.strip()
 
 
+# --- outgoing style + thread-history hygiene -------------------------------
+# Platform rule: no em/en dashes in anything Bella sends.
+_DASH_RE = re.compile(r"\s*[—–―‒]\s*")
+# Start of a prior quoted chain in an inbound body.
+_QUOTE_CHAIN_RE = re.compile(r"^\s*On .{4,120} wrote:\s*$")
+# Start of a signature / legal / marketing footer. Conservative: each marker
+# only ever precedes footer content, never message body.
+_SIG_BOUNDARY_RE = re.compile(
+    r"^\s*("
+    r"--\s*$"
+    r"|\**\s*confidentiality notice"
+    r"|\**\s*ai assistance and compliance"
+    r"|this email and any attachments"
+    r"|\**\s*tmh group\**\s*$"
+    r"|sent from my (i|android)"
+    r")",
+    re.IGNORECASE,
+)
+# Lines that are nothing but a (possibly angle-bracketed) URL: logo/social
+# links that text rendering of HTML mail leaves behind. Pure noise in a quote.
+_BARE_URL_LINE_RE = re.compile(r"^\s*<?https?://\S+>?\s*$")
+
+
+def _sanitize_outgoing_style(text: str) -> str:
+    """Enforce the no-dash rule on every outgoing email body."""
+    out = _DASH_RE.sub(", ", text)
+    out = re.sub(r"\s+,", ",", out)
+    out = re.sub(r",\s*,", ", ", out)
+    out = re.sub(r",\s*([.!?])", r"\1", out)
+    return out
+
+
+def _clean_message_text(body: str) -> str:
+    """The sender's NEW words only: stop at any prior quoted chain and at the
+    signature/legal/marketing footer; drop quoted lines and bare-URL lines."""
+    kept: List[str] = []
+    for line in (body or "").splitlines():
+        if _QUOTE_CHAIN_RE.match(line) or _SIG_BOUNDARY_RE.match(line):
+            break
+        if line.lstrip().startswith(">"):
+            continue
+        if _BARE_URL_LINE_RE.match(line):
+            continue
+        kept.append(line.rstrip())
+    out = "\n".join(kept)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+
+def _quote_blocks(ctx: Dict[str, str]) -> Tuple[str, str]:
+    """Mail-client-style quoted history (plain + HTML) from the stored thread
+    context. Quotes only the sender's cleaned words, never their footer."""
+    import html as _html
+
+    original = _clean_message_text(ctx.get("body", ""))
+    if not original:
+        return "", ""
+    if len(original) > 1500:
+        original = original[:1500].rstrip() + "\n[...]"
+    who = ctx.get("from_name") or ctx.get("from_addr") or "you"
+    date = (ctx.get("date") or "").strip()
+    attribution = f"On {date}, {who} wrote:" if date else f"{who} wrote:"
+    plain = f"\n\n{attribution}\n" + "\n".join("> " + ln for ln in original.splitlines())
+    html_quote = (
+        f'<div style="margin-top:18px;color:#5f6368;font-size:13px">{_html.escape(attribution)}</div>'
+        f'<blockquote style="margin:6px 0 0 0;padding-left:12px;border-left:2px solid #dadce0;'
+        f'color:#5f6368;font-size:13px">{_html.escape(original).replace(chr(10), "<br>")}</blockquote>'
+    )
+    return plain, html_quote
+
+
+def _html_body(reply_text: str, html_quote: str) -> str:
+    """Simple, clean HTML alternative: reply paragraphs + quoted history."""
+    import html as _html
+
+    paras = [p for p in re.split(r"\n\s*\n", reply_text.strip()) if p.strip()]
+    rendered = "".join(
+        '<p style="margin:0 0 14px 0">' + _html.escape(p).replace("\n", "<br>") + "</p>"
+        for p in paras
+    )
+    return (
+        '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#202124;'
+        f'line-height:1.5">{rendered}{html_quote}</div>'
+    )
+
+
 def _extract_email_address(raw: str) -> str:
     """Extract bare email address from 'Name <addr>' format."""
     match = re.search(r"<([^>]+)>", raw)
@@ -343,6 +429,16 @@ class EmailAdapter(BasePlatformAdapter):
 
         # Map chat_id (sender email) -> last subject + message-id for threading
         self._thread_context: Dict[str, Dict[str, str]] = {}
+
+        # Coalesce rapid agent message bursts into ONE email. Chat brains often
+        # emit several short messages per turn; on chat platforms that is fine,
+        # but over SMTP each send becomes a separate email (observed: 3 emails
+        # in one minute on a single thread). Buffer per recipient and flush
+        # after a quiet period.
+        self._coalesce_s = float(os.getenv("EMAIL_SEND_COALESCE_S", "20"))
+        self._outbox: Dict[str, List[str]] = {}
+        self._outbox_reply_to: Dict[str, Optional[str]] = {}
+        self._flush_tasks: Dict[str, asyncio.Task] = {}
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -496,7 +592,12 @@ class EmailAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        """Stop polling and disconnect."""
+        """Stop polling and disconnect (flushing any coalesced replies first)."""
+        for chat_id in list(self._outbox.keys()):
+            try:
+                await self._flush_outbox(chat_id)
+            except Exception as e:
+                logger.error("[Email] Flush on disconnect failed for %s: %s", chat_id, e)
         self._running = False
         if self._poll_task:
             self._poll_task.cancel()
@@ -624,10 +725,15 @@ class EmailAdapter(BasePlatformAdapter):
         body = msg_data["body"].strip()
         attachments = msg_data["attachments"]
 
+        # The brain gets only the sender's NEW words: prior quoted chains and
+        # signature/legal/marketing footers are noise that wastes context and
+        # gets parroted back into replies as ugly fake "history".
+        brain_body = _clean_message_text(body) or body
+
         # Build message text: include subject as context
-        text = body
+        text = brain_body
         if subject and not subject.startswith("Re:"):
-            text = f"[Subject: {subject}]\n\n{body}"
+            text = f"[Subject: {subject}]\n\n{brain_body}"
 
         # Determine message type and media
         media_urls = []
@@ -686,7 +792,43 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an email reply to the given address."""
+        """Queue an email reply; rapid consecutive messages to the same address
+        coalesce into a single email (flushed after a quiet period)."""
+        # Internal control notices (gateway restart/shutdown broadcasts) are
+        # chat-channel UX; over email they read as alarming nonsense to humans.
+        if content.lstrip().startswith("⚠️ Gateway"):
+            logger.info("[Email] Suppressed control notice to %s", chat_id)
+            return SendResult(success=True, message_id="suppressed-control-notice")
+        if self._coalesce_s <= 0:
+            return await self._send_now(chat_id, content, reply_to)
+        self._outbox.setdefault(chat_id, []).append(content)
+        if reply_to:
+            self._outbox_reply_to[chat_id] = reply_to
+        prior = self._flush_tasks.get(chat_id)
+        if prior and not prior.done():
+            prior.cancel()
+        self._flush_tasks[chat_id] = asyncio.create_task(self._flush_later(chat_id))
+        return SendResult(success=True, message_id=f"queued-{uuid.uuid4().hex[:8]}")
+
+    async def _flush_later(self, chat_id: str) -> None:
+        try:
+            await asyncio.sleep(self._coalesce_s)
+        except asyncio.CancelledError:
+            return
+        await self._flush_outbox(chat_id)
+
+    async def _flush_outbox(self, chat_id: str) -> None:
+        parts = self._outbox.pop(chat_id, [])
+        reply_to = self._outbox_reply_to.pop(chat_id, None)
+        self._flush_tasks.pop(chat_id, None)
+        body = "\n\n".join(p.strip() for p in parts if p and p.strip())
+        if not body:
+            return
+        await self._send_now(chat_id, body, reply_to)
+
+    async def _send_now(
+        self, chat_id: str, content: str, reply_to: Optional[str] = None
+    ) -> SendResult:
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
@@ -703,8 +845,12 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         reply_to_msg_id: Optional[str] = None,
     ) -> str:
-        """Send an email via SMTP. Runs in executor thread."""
-        msg = MIMEMultipart()
+        """Send an email via SMTP. Runs in executor thread.
+
+        Renders like a real mail client: multipart/alternative (plain + HTML),
+        no-dash style enforced, and a clean quoted-history block built from the
+        message being replied to (sender's words only, footers trimmed)."""
+        msg = MIMEMultipart("alternative")
         msg["From"] = self._address
         msg["To"] = to_addr
 
@@ -727,7 +873,10 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        body = _sanitize_outgoing_style(body)
+        quote_plain, quote_html = _quote_blocks(ctx)
+        msg.attach(MIMEText(body + quote_plain, "plain", "utf-8"))
+        msg.attach(MIMEText(_html_body(body, quote_html), "html", "utf-8"))
 
         smtp = self._connect_smtp()
         try:

@@ -639,14 +639,17 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["References"], "<original@test.com>")
             self.assertIn("Date", send_call)
 
-    def test_reply_preserves_references_chain_without_body_quote(self):
-        """Replies should use RFC threading headers, not append a manual quoted history block."""
+    def test_reply_preserves_references_chain_with_clean_quote(self):
+        """Replies keep RFC threading headers AND a clean mail-client-style quote
+        of the message being replied to (owner directive 2026-06-11: replies must
+        carry readable history; footers/legal/marketing are trimmed)."""
         adapter = self._make_adapter()
         adapter._thread_context["user@test.com"] = {
             "subject": "Project question",
             "message_id": "<original@test.com>",
             "references": "<root@test.com> <prior@test.com>",
-            "body": "Original message that should not be copied into Bella's reply.",
+            "from_name": "Pat User",
+            "body": "Original message that should be quoted cleanly.",
         }
 
         with patch("smtplib.SMTP") as mock_smtp:
@@ -661,9 +664,9 @@ class TestThreadContext(unittest.TestCase):
                 "<root@test.com> <prior@test.com> <original@test.com>",
             )
             payload = send_call.get_payload()[0].get_payload(decode=True).decode("utf-8")
-            self.assertEqual(payload, "Here is the answer.")
-            self.assertNotIn("Original message", payload)
-            self.assertNotIn("wrote:", payload)
+            self.assertTrue(payload.startswith("Here is the answer."))
+            self.assertIn("Pat User wrote:", payload)
+            self.assertIn("> Original message that should be quoted cleanly.", payload)
 
     def test_reply_does_not_double_re(self):
         """If subject already has Re:, don't add another."""
@@ -715,9 +718,10 @@ class TestSendMethods(unittest.TestCase):
         return adapter
 
     def test_send_calls_smtp(self):
-        """send() should use SMTP to deliver email."""
+        """send() should use SMTP to deliver email (immediate path)."""
         import asyncio
         adapter = self._make_adapter()
+        adapter._coalesce_s = 0  # immediate send, no burst buffering
 
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
@@ -734,9 +738,10 @@ class TestSendMethods(unittest.TestCase):
             mock_server.quit.assert_called_once()
 
     def test_send_failure_returns_error(self):
-        """SMTP failure should return SendResult with error."""
+        """SMTP failure should return SendResult with error (immediate path)."""
         import asyncio
         adapter = self._make_adapter()
+        adapter._coalesce_s = 0  # immediate send, no burst buffering
 
         with patch("smtplib.SMTP") as mock_smtp:
             mock_smtp.side_effect = Exception("Connection refused")
@@ -1424,6 +1429,115 @@ class TestConnectSmtp(unittest.TestCase):
             "smtp.test.com", 587, _socket.AF_INET, _socket.SOCK_STREAM,
         )
         self.assertIs(_socket.getaddrinfo, original_getaddrinfo)
+def _adapter_for_send():
+    """EmailAdapter with mocked env for send-path tests."""
+    from gateway.config import PlatformConfig
+    with patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
+        "EMAIL_IMAP_HOST": "imap.test.com",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+    }):
+        from gateway.platforms.email import EmailAdapter
+        return EmailAdapter(PlatformConfig(enabled=True))
+
+
+class TestOutgoingHygiene(unittest.TestCase):
+    """Quoted-history hygiene, no-dash style, HTML alternative, coalescing."""
+
+    CHRIS_BODY = (
+        "Bella,\n\nReview this email thread, the history looks messed up. Please fix\n\n"
+        "<https://millennialinsgroup.com/>\n\n"
+        "Chris Barnes\n\nPresident\n\n"
+        "*Confidentiality Notice: *This email and any attachments are intended only\n"
+        "for the addressee(s).\n"
+        "*TMH Group*\n"
+    )
+
+    def test_clean_message_text_strips_footer_and_bare_urls(self):
+        from gateway.platforms.email import _clean_message_text
+        out = _clean_message_text(self.CHRIS_BODY)
+        self.assertIn("Review this email thread", out)
+        self.assertIn("Chris Barnes", out)
+        self.assertNotIn("Confidentiality", out)
+        self.assertNotIn("TMH Group", out)
+        self.assertNotIn("https://millennialinsgroup.com", out)
+
+    def test_clean_message_text_stops_at_prior_chain(self):
+        from gateway.platforms.email import _clean_message_text
+        body = ("New reply here\n\nOn Thu, 11 Jun 2026 10:21:45 -0400, Chris Barnes wrote:\n"
+                "> old stuff\n> more old")
+        self.assertEqual(_clean_message_text(body), "New reply here")
+
+    def test_sanitize_outgoing_style_removes_em_dashes(self):
+        from gateway.platforms.email import _sanitize_outgoing_style
+        out = _sanitize_outgoing_style("Shutting down — task interrupted – sorry")
+        self.assertNotIn("—", out)
+        self.assertNotIn("–", out)
+
+    def test_quote_blocks_build_attribution_and_blockquote(self):
+        from gateway.platforms.email import _quote_blocks
+        ctx = {"body": self.CHRIS_BODY, "from_name": "Chris Barnes",
+               "from_addr": "chris@test.com", "date": "Thu, 11 Jun 2026 10:21:45 -0400"}
+        plain, html = _quote_blocks(ctx)
+        self.assertIn("On Thu, 11 Jun 2026 10:21:45 -0400, Chris Barnes wrote:", plain)
+        self.assertIn("> Review this email thread", plain)
+        self.assertNotIn("Confidentiality", plain)
+        self.assertIn("<blockquote", html)
+        self.assertNotIn("TMH Group", html)
+
+    def test_send_email_builds_multipart_alternative_with_clean_quote(self):
+        adapter = _adapter_for_send()
+        adapter._thread_context["chris@test.com"] = {
+            "subject": "Test", "message_id": "<orig@x>", "references": "",
+            "from_name": "Chris Barnes", "from_addr": "chris@test.com",
+            "date": "Thu, 11 Jun 2026 10:21:45 -0400", "body": self.CHRIS_BODY,
+        }
+        sent = {}
+        with patch("smtplib.SMTP") as smtp_cls:
+            smtp = smtp_cls.return_value
+            smtp.send_message.side_effect = lambda m: sent.update(msg=m)
+            adapter._send_email("chris@test.com", "Got it — fixing the thread now.", None)
+        msg = sent["msg"]
+        self.assertEqual(msg.get_content_type(), "multipart/alternative")
+        parts = {p.get_content_type(): p.get_payload(decode=True).decode()
+                 for p in msg.get_payload()}
+        self.assertIn("text/plain", parts)
+        self.assertIn("text/html", parts)
+        self.assertNotIn("—", parts["text/plain"])          # no-dash rule
+        self.assertIn("Chris Barnes wrote:", parts["text/plain"])
+        self.assertIn("<blockquote", parts["text/html"])
+        self.assertNotIn("Confidentiality", parts["text/plain"])
+
+    def test_control_notices_are_suppressed(self):
+        import asyncio
+
+        async def run():
+            adapter = _adapter_for_send()
+            return adapter, await adapter.send(
+                "chris@test.com",
+                "⚠️ Gateway shutting down — Your current task will be interrupted.")
+        adapter, res = asyncio.new_event_loop().run_until_complete(run())
+        self.assertTrue(res.success)
+        self.assertEqual(res.message_id, "suppressed-control-notice")
+        self.assertEqual(adapter._outbox, {})
+
+    def test_burst_sends_coalesce_into_one_email(self):
+        import asyncio
+
+        async def run():
+            adapter = _adapter_for_send()
+            adapter._coalesce_s = 0.1
+            with patch.object(adapter, "_send_now", new=AsyncMock()) as send_now:
+                await adapter.send("chris@test.com", "part one")
+                await adapter.send("chris@test.com", "part two")
+                await adapter.send("chris@test.com", "part three")
+                await asyncio.sleep(0.5)
+                send_now.assert_awaited_once()
+                body = send_now.await_args.args[1]
+                assert body == "part one\n\npart two\n\npart three", body
+        asyncio.new_event_loop().run_until_complete(run())
 
 
 if __name__ == "__main__":
