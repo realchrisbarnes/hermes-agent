@@ -218,6 +218,21 @@ def _extract_text_body(msg: email_lib.message.Message) -> str:
         return ""
 
 
+def _extract_html_body(msg: email_lib.message.Message) -> str:
+    """Extract the HTML body (if any) so replies can quote the sender's
+    history exactly as it rendered for them."""
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        if "attachment" in str(part.get("Content-Disposition", "")):
+            continue
+        if part.get_content_type() == "text/html":
+            payload = part.get_payload(decode=True)
+            if payload:
+                charset = part.get_content_charset() or "utf-8"
+                return payload.decode(charset, errors="replace")
+    return ""
+
+
 def _strip_html(html: str) -> str:
     """Naive HTML tag stripper for fallback text extraction."""
     text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
@@ -293,24 +308,58 @@ def _clean_message_text(body: str, sender_name: str = "") -> str:
     return out
 
 
+# Bella's outgoing signature (matches the autoreply lane's branding).
+SIGNATURE_TEXT = (
+    "Bella AI\n"
+    "Director of Strategic Operations, Millennial Insurance Group\n"
+    "bella@millennialinsgroup.com | millennialinsgroup.com\n"
+    "Sent with AI assistance."
+)
+SIGNATURE_HTML = (
+    '<div style="margin-top:18px;color:#444;font-family:Arial,Helvetica,sans-serif;'
+    'font-size:13px;line-height:1.5">'
+    '<div style="font-weight:bold;color:#222">Bella AI</div>'
+    '<div>Director of Strategic Operations, Millennial Insurance Group</div>'
+    '<div><a href="mailto:bella@millennialinsgroup.com" style="color:#467886">'
+    'bella@millennialinsgroup.com</a> &nbsp;|&nbsp; '
+    '<a href="https://millennialinsgroup.com/" style="color:#467886">millennialinsgroup.com</a></div>'
+    '<div style="color:#999;font-size:11px;margin-top:4px">Sent with AI assistance.</div>'
+    '</div>'
+)
+
+# Cap on quoted history size, generous: full threads with signatures fit, but a
+# pathological chain cannot blow past SMTP size limits.
+QUOTE_MAX_CHARS = 40_000
+
+
 def _quote_blocks(ctx: Dict[str, str]) -> Tuple[str, str]:
     """Mail-client-style quoted history (plain + HTML) from the stored thread
-    context. Quotes only the sender's cleaned words, never their footer."""
+    context. FULL fidelity, like Gmail: the entire message being replied to is
+    quoted, including the sender's signature and any nested earlier quotes
+    (owner directive 2026-06-11: history must be complete, nothing trimmed)."""
     import html as _html
 
-    original = _clean_message_text(ctx.get("body", ""), ctx.get("from_name", ""))
+    original = (ctx.get("body") or "").rstrip()
     if not original:
         return "", ""
-    if len(original) > 1500:
-        original = original[:1500].rstrip() + "\n[...]"
+    if len(original) > QUOTE_MAX_CHARS:
+        original = original[:QUOTE_MAX_CHARS].rstrip() + "\n[history truncated]"
     who = ctx.get("from_name") or ctx.get("from_addr") or "you"
     date = (ctx.get("date") or "").strip()
     attribution = f"On {date}, {who} wrote:" if date else f"{who} wrote:"
+    # Standard nesting: prefix every line (including already-quoted ones) once more.
     plain = f"\n\n{attribution}\n" + "\n".join("> " + ln for ln in original.splitlines())
+    original_html = (ctx.get("body_html") or "").strip()
+    if original_html and len(original_html) <= QUOTE_MAX_CHARS * 4:
+        # Embed the sender's real HTML so the quoted history renders exactly as
+        # they sent it (logos, links, formatting), like a real mail client.
+        inner = original_html
+    else:
+        inner = _html.escape(original).replace("\n", "<br>")
     html_quote = (
         f'<div style="margin-top:18px;color:#5f6368;font-size:13px">{_html.escape(attribution)}</div>'
-        f'<blockquote style="margin:6px 0 0 0;padding-left:12px;border-left:2px solid #dadce0;'
-        f'color:#5f6368;font-size:13px">{_html.escape(original).replace(chr(10), "<br>")}</blockquote>'
+        f'<blockquote style="margin:6px 0 0 8px;padding-left:12px;border-left:2px solid #dadce0">'
+        f"{inner}</blockquote>"
     )
     return plain, html_quote
 
@@ -685,6 +734,7 @@ class EmailAdapter(BasePlatformAdapter):
                         logger.debug("[Email] Skipping automated sender: %s", sender_addr)
                         continue
                     body = _extract_text_body(msg)
+                    body_html = _extract_html_body(msg)
                     attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
 
                     results.append({
@@ -696,6 +746,7 @@ class EmailAdapter(BasePlatformAdapter):
                         "in_reply_to": in_reply_to,
                         "references": references,
                         "body": body,
+                        "body_html": body_html,
                         "attachments": attachments,
                         "date": msg.get("Date", ""),
                     })
@@ -774,6 +825,7 @@ class EmailAdapter(BasePlatformAdapter):
             "from_addr": sender_addr,
             "date": msg_data.get("date", ""),
             "body": body,
+            "body_html": msg_data.get("body_html", ""),
         }
 
         source = self.build_source(
@@ -885,10 +937,12 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
         msg["Message-ID"] = msg_id
 
+        # Sanitize only Bella's words; the quoted history is the sender's
+        # content and is reproduced verbatim.
         body = _sanitize_outgoing_style(body)
         quote_plain, quote_html = _quote_blocks(ctx)
-        msg.attach(MIMEText(body + quote_plain, "plain", "utf-8"))
-        msg.attach(MIMEText(_html_body(body, quote_html), "html", "utf-8"))
+        msg.attach(MIMEText(body + "\n\n" + SIGNATURE_TEXT + quote_plain, "plain", "utf-8"))
+        msg.attach(MIMEText(_html_body(body, SIGNATURE_HTML + quote_html), "html", "utf-8"))
 
         smtp = self._connect_smtp()
         try:
