@@ -291,11 +291,18 @@ def _quote_blocks(ctx: Dict[str, str]) -> Tuple[str, str]:
         return "", ""
     if len(original) > QUOTE_MAX_CHARS:
         original = original[:QUOTE_MAX_CHARS].rstrip() + "\n[history truncated]"
-    who = ctx.get("from_name") or ctx.get("from_addr") or "you"
-    date = (ctx.get("date") or "").strip()
-    attribution = f"On {date}, {who} wrote:" if date else f"{who} wrote:"
+    who = (ctx.get("from_name") or "").strip()
+    addr = (ctx.get("from_addr") or "").strip()
+    sender = f"{who} <{addr}>" if who and addr and who != addr else (who or addr or "unknown")
+    # Outlook-style header block so the thread shows who was on each message.
+    fields = [("From", sender), ("Sent", (ctx.get("date") or "").strip()),
+              ("To", (ctx.get("to") or "").strip()), ("Cc", (ctx.get("cc") or "").strip()),
+              ("Subject", (ctx.get("subject") or "").strip())]
+    fields = [(k, v) for k, v in fields if v]
+    header_plain = "\n".join(f"{k}: {v}" for k, v in fields)
     # Standard nesting: prefix every line (including already-quoted ones) once more.
-    plain = f"\n\n{attribution}\n" + "\n".join("> " + ln for ln in original.splitlines())
+    plain = ("\n\n" + "-" * 34 + "\n" + header_plain + "\n\n"
+             + "\n".join("> " + ln for ln in original.splitlines()))
     original_html = (ctx.get("body_html") or "").strip()
     if original_html and len(original_html) <= QUOTE_MAX_CHARS * 4:
         # Embed the sender's real HTML so the quoted history renders exactly as
@@ -303,12 +310,42 @@ def _quote_blocks(ctx: Dict[str, str]) -> Tuple[str, str]:
         inner = original_html
     else:
         inner = _html.escape(original).replace("\n", "<br>")
+    header_html = "".join(
+        f'<div><b>{_html.escape(k)}:</b> {_html.escape(v)}</div>' for k, v in fields
+    )
     html_quote = (
-        f'<div style="margin-top:18px;color:#5f6368;font-size:13px">{_html.escape(attribution)}</div>'
-        f'<blockquote style="margin:6px 0 0 8px;padding-left:12px;border-left:2px solid #dadce0">'
+        f'<div style="margin-top:18px;border-top:1px solid #e0e0e0;padding-top:10px;'
+        f'color:#5f6368;font-size:13px">{header_html}</div>'
+        f'<blockquote style="margin:10px 0 0 8px;padding-left:12px;border-left:2px solid #dadce0">'
         f"{inner}</blockquote>"
     )
     return plain, html_quote
+
+
+_DATA_IMG_RE = re.compile(r'src="data:image/(png|jpe?g|gif);base64,([A-Za-z0-9+/=\s]+)"')
+
+
+def _inline_data_images(html: str) -> Tuple[str, List[Tuple[str, str, bytes]]]:
+    """Rewrite data: image URIs into cid: inline attachments.
+
+    Gmail and most clients BLOCK data: images in received mail, which is why
+    the native signature's embedded logos never loaded. cid-referenced inline
+    MIME parts are the standard that every client renders."""
+    import base64 as _b64
+
+    images: List[Tuple[str, str, bytes]] = []
+
+    def repl(match: "re.Match[str]") -> str:
+        subtype = "jpeg" if match.group(1) in ("jpeg", "jpg") else match.group(1)
+        try:
+            blob = _b64.b64decode(match.group(2))
+        except Exception:
+            return match.group(0)
+        cid = f"inlineimg{len(images)}"
+        images.append((cid, subtype, blob))
+        return f'src="cid:{cid}"'
+
+    return _DATA_IMG_RE.sub(repl, html), images
 
 
 def _html_body(reply_text: str, html_quote: str) -> str:
@@ -654,6 +691,8 @@ class EmailAdapter(BasePlatformAdapter):
                         "body_html": body_html,
                         "attachments": attachments,
                         "date": msg.get("Date", ""),
+                        "to": _decode_header_value(msg.get("To", "")),
+                        "cc": _decode_header_value(msg.get("Cc", "")),
                     })
             finally:
                 try:
@@ -724,6 +763,8 @@ class EmailAdapter(BasePlatformAdapter):
             "date": msg_data.get("date", ""),
             "body": body,
             "body_html": msg_data.get("body_html", ""),
+            "to": msg_data.get("to", ""),
+            "cc": msg_data.get("cc", ""),
         }
 
         source = self.build_source(
@@ -809,18 +850,42 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email via SMTP. Runs in executor thread.
 
-        Renders like a real mail client: multipart/alternative (plain + HTML),
-        no-dash style enforced, and a clean quoted-history block built from the
-        message being replied to (sender's words only, footers trimmed)."""
-        msg = MIMEMultipart("alternative")
-        msg["From"] = self._address
-        msg["To"] = to_addr
-
+        Renders like a real mail client: multipart/related(alternative) with
+        the native signature's images as cid inline attachments, an
+        Outlook-style From/Sent/To/Cc header block over the quoted history,
+        and no-dash style on Bella's own words only."""
         # Thread context for reply
         ctx = self._thread_context.get(to_addr, {})
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
+
+        # Sanitize only Bella's words; the quoted history is the sender's
+        # content and is reproduced verbatim.
+        body = _sanitize_outgoing_style(body)
+        quote_plain, quote_html = _quote_blocks(ctx)
+        sig_text, sig_html = _native_signature()
+        plain_sig = ("\n\n" + sig_text) if sig_text else ""
+        html_full, inline_images = _inline_data_images(_html_body(body, sig_html + quote_html))
+
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body + plain_sig + quote_plain, "plain", "utf-8"))
+        alt.attach(MIMEText(html_full, "html", "utf-8"))
+
+        if inline_images:
+            from email.mime.image import MIMEImage
+            msg = MIMEMultipart("related")
+            msg.attach(alt)
+            for cid, subtype, blob in inline_images:
+                img = MIMEImage(blob, _subtype=subtype)
+                img.add_header("Content-ID", f"<{cid}>")
+                img.add_header("Content-Disposition", "inline")
+                msg.attach(img)
+        else:
+            msg = alt
+
+        msg["From"] = self._address
+        msg["To"] = to_addr
         msg["Subject"] = subject
 
         # Threading headers
@@ -834,15 +899,6 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
         msg["Message-ID"] = msg_id
-
-        # Sanitize only Bella's words; the quoted history is the sender's
-        # content and is reproduced verbatim.
-        body = _sanitize_outgoing_style(body)
-        quote_plain, quote_html = _quote_blocks(ctx)
-        sig_text, sig_html = _native_signature()
-        plain_sig = ("\n\n" + sig_text) if sig_text else ""
-        msg.attach(MIMEText(body + plain_sig + quote_plain, "plain", "utf-8"))
-        msg.attach(MIMEText(_html_body(body, sig_html + quote_html), "html", "utf-8"))
 
         smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
         try:
