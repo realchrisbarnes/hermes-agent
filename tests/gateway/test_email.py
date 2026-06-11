@@ -29,6 +29,7 @@ class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
     }, clear=False)
@@ -43,6 +44,7 @@ class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_HOME_ADDRESS": "user@test.com",
@@ -242,6 +244,7 @@ class TestDispatchMessage(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
+            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_IMAP_PORT": "993",
             "EMAIL_SMTP_HOST": "smtp.test.com",
@@ -579,6 +582,7 @@ class TestThreadContext(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
+            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
         }):
@@ -635,6 +639,32 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["References"], "<original@test.com>")
             self.assertIn("Date", send_call)
 
+    def test_reply_preserves_references_chain_without_body_quote(self):
+        """Replies should use RFC threading headers, not append a manual quoted history block."""
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Project question",
+            "message_id": "<original@test.com>",
+            "references": "<root@test.com> <prior@test.com>",
+            "body": "Original message that should not be copied into Bella's reply.",
+        }
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email("user@test.com", "Here is the answer.", None)
+
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(
+                send_call["References"],
+                "<root@test.com> <prior@test.com> <original@test.com>",
+            )
+            payload = send_call.get_payload()[0].get_payload(decode=True).decode("utf-8")
+            self.assertEqual(payload, "Here is the answer.")
+            self.assertNotIn("Original message", payload)
+            self.assertNotIn("wrote:", payload)
+
     def test_reply_does_not_double_re(self):
         """If subject already has Re:, don't add another."""
         adapter = self._make_adapter()
@@ -676,6 +706,7 @@ class TestSendMethods(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
+            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
         }):
@@ -795,6 +826,7 @@ class TestConnectDisconnect(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
+            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
         }):
@@ -873,6 +905,7 @@ class TestFetchNewMessages(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
+            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
         }):
@@ -966,6 +999,7 @@ class TestPollLoop(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
+            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
             "EMAIL_POLL_INTERVAL": "1",
@@ -1014,6 +1048,7 @@ class TestSendEmailStandalone(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
     })
@@ -1044,6 +1079,7 @@ class TestSendEmailStandalone(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_SMTP_HOST": "smtp.test.com",
     })
     def test_send_email_tool_failure(self):
@@ -1079,6 +1115,7 @@ class TestSmtpConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
@@ -1091,6 +1128,7 @@ class TestSmtpConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
@@ -1110,6 +1148,7 @@ class TestSmtpConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
@@ -1134,6 +1173,7 @@ class TestImapConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_IMAP_PORT": "993",
         "EMAIL_SMTP_HOST": "smtp.test.com",
@@ -1146,6 +1186,7 @@ class TestImapConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_IMAP_PORT": "993",
         "EMAIL_SMTP_HOST": "smtp.test.com",
@@ -1173,6 +1214,7 @@ class TestImapConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
+        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_IMAP_PORT": "993",
         "EMAIL_SMTP_HOST": "smtp.test.com",
@@ -1202,6 +1244,7 @@ class TestImapIdExtensionForNetEase(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@163.com",
             "EMAIL_PASSWORD": "secret",
+            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.163.com",
             "EMAIL_SMTP_HOST": "smtp.163.com",
         }):

@@ -140,6 +140,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if _require_mention is None:
             _require_mention = os.getenv("BLUEBUBBLES_REQUIRE_MENTION")
         self.require_mention = str(_require_mention).strip().lower() in {"true", "1", "yes", "on"}
+        # DM-only mode: when enabled, the agent NEVER responds in iMessage group
+        # threads — every group message is dropped here so the conversational
+        # transport stays 1:1 only. This preserves Bella's silent-observer role in
+        # groups (the chat.db task extractor keeps collecting independently). Default
+        # ON for safety; set BLUEBUBBLES_DM_ONLY=false to allow group responses.
+        _dm_only = extra.get("dm_only")
+        if _dm_only is None:
+            _dm_only = os.getenv("BLUEBUBBLES_DM_ONLY", "true")
+        self.dm_only = str(_dm_only).strip().lower() in {"true", "1", "yes", "on"}
         self._mention_patterns = self._compile_mention_patterns(
             extra["mention_patterns"]
             if "mention_patterns" in extra
@@ -995,6 +1004,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
+        if is_group and self.dm_only:
+            # Silent-observer guarantee: never respond in any iMessage group. The
+            # chat.db task extractor still observes/collects this thread separately.
+            logger.debug("[bluebubbles] dropping group message (dm_only=true; staying silent in groups)")
+            return web.Response(text="ok")
         if is_group and self.require_mention:
             if not self._message_matches_mention_patterns(text):
                 logger.debug(

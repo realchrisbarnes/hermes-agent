@@ -308,6 +308,21 @@ class EmailAdapter(BasePlatformAdapter):
 
         self._address = os.getenv("EMAIL_ADDRESS", "")
         self._password = os.getenv("EMAIL_PASSWORD", "")
+        # Auth method: "password" (default) or "xoauth2". XOAUTH2 uses Bella's existing
+        # Google OAuth credential (full mail scope) so no app-password is needed. The
+        # access token is minted by an isolated bella-venv subprocess (keeps the
+        # google-auth dependency out of the gateway venv) and cached until ~5 min before
+        # expiry. Falls back to password login transparently when not configured.
+        self._auth_method = os.getenv("EMAIL_AUTH_METHOD", "password").strip().lower()
+        self._xoauth2_py = os.getenv(
+            "EMAIL_XOAUTH2_PYTHON", "/Users/bella-ai/Bella/active/.venv-bella/bin/python"
+        )
+        self._xoauth2_helper = os.getenv(
+            "EMAIL_XOAUTH2_HELPER",
+            "/Users/bella-ai/Bella/active/bella-build/scripts/email_xoauth2_token.py",
+        )
+        self._xoauth2_token: str = ""
+        self._xoauth2_token_exp: float = 0.0
         self._imap_host = os.getenv("EMAIL_IMAP_HOST", "")
         self._imap_port = int(os.getenv("EMAIL_IMAP_PORT", "993"))
         self._smtp_host = os.getenv("EMAIL_SMTP_HOST", "")
@@ -330,6 +345,56 @@ class EmailAdapter(BasePlatformAdapter):
         self._thread_context: Dict[str, Dict[str, str]] = {}
 
         logger.info("[Email] Adapter initialized for %s", self._address)
+
+    def _xoauth2_sasl(self) -> str:
+        """Return a fresh XOAUTH2 SASL string, minting/refreshing the token as needed."""
+        import json as _json
+        import subprocess as _sp
+        import time as _time
+
+        now = _time.time()
+        if not self._xoauth2_token or now >= (self._xoauth2_token_exp - 300):
+            out = _sp.run(
+                [self._xoauth2_py, self._xoauth2_helper],
+                capture_output=True, text=True, timeout=30,
+            )
+            data = _json.loads(out.stdout or "{}")
+            if not data.get("access_token"):
+                raise RuntimeError(f"xoauth2 token mint failed: {data.get('error', out.stderr)[:120]}")
+            self._xoauth2_token = data["access_token"]
+            self._xoauth2_token_exp = float(data.get("expiry_epoch") or 0) or (now + 1800)
+        return f"user={self._address}\x01auth=Bearer {self._xoauth2_token}\x01\x01"
+
+    def _imap_login(self, imap) -> None:
+        """Authenticate an IMAP connection (XOAUTH2 when configured, else password)."""
+        if self._auth_method == "xoauth2":
+            imap.authenticate("XOAUTH2", lambda _x: self._xoauth2_sasl().encode())
+        else:
+            imap.login(self._address, self._password)
+
+    def _smtp_login(self, smtp) -> None:
+        """Authenticate an SMTP connection (XOAUTH2 when configured, else password)."""
+        if self._auth_method == "xoauth2":
+            import base64 as _b64
+            smtp.ehlo()
+            code, resp = smtp.docmd(
+                "AUTH", "XOAUTH2 " + _b64.b64encode(self._xoauth2_sasl().encode()).decode()
+            )
+            if code != 235:
+                raise RuntimeError(f"smtp xoauth2 auth failed: {code} {resp!r}")
+        else:
+            smtp.login(self._address, self._password)
+
+    @staticmethod
+    def _thread_references(ctx: Dict[str, str], original_msg_id: Optional[str]) -> str:
+        """Return a clean RFC 5322 References header preserving the existing chain."""
+        refs: List[str] = []
+        for token in (ctx.get("references", "") or "").split():
+            if token and token not in refs:
+                refs.append(token)
+        if original_msg_id and original_msg_id not in refs:
+            refs.append(original_msg_id)
+        return " ".join(refs)
 
     def _trim_seen_uids(self) -> None:
         """Keep only the most recent UIDs to prevent unbounded memory growth.
@@ -398,7 +463,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             # Test IMAP connection
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
-            imap.login(self._address, self._password)
+            self._imap_login(imap)
             _send_imap_id(imap)
             # Mark all existing messages as seen so we only process new ones
             imap.select("INBOX")
@@ -416,11 +481,10 @@ class EmailAdapter(BasePlatformAdapter):
 
         try:
             # Test SMTP connection
-            smtp = self._connect_smtp()
-            try:
-                smtp.login(self._address, self._password)
-            finally:
-                smtp.quit()
+            smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
+            smtp.starttls(context=ssl.create_default_context())
+            self._smtp_login(smtp)
+            smtp.quit()
             logger.info("[Email] SMTP connection test passed.")
         except Exception as e:
             logger.error("[Email] SMTP connection failed: %s", e)
@@ -468,7 +532,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
             try:
-                imap.login(self._address, self._password)
+                self._imap_login(imap)
                 _send_imap_id(imap)
                 imap.select("INBOX")
 
@@ -501,6 +565,7 @@ class EmailAdapter(BasePlatformAdapter):
                     subject = _decode_header_value(msg.get("Subject", "(no subject)"))
                     message_id = msg.get("Message-ID", "")
                     in_reply_to = msg.get("In-Reply-To", "")
+                    references = msg.get("References", "")
                     # Skip automated/noreply senders before any processing
                     msg_headers = dict(msg.items())
                     if _is_automated_sender(sender_addr, msg_headers):
@@ -516,6 +581,7 @@ class EmailAdapter(BasePlatformAdapter):
                         "subject": subject,
                         "message_id": message_id,
                         "in_reply_to": in_reply_to,
+                        "references": references,
                         "body": body,
                         "attachments": attachments,
                         "date": msg.get("Date", ""),
@@ -581,10 +647,15 @@ class EmailAdapter(BasePlatformAdapter):
                 # only classification that surfaces both.
                 msg_type = MessageType.DOCUMENT
 
-        # Store thread context for reply threading
+        # Store thread context for RFC email threading headers on reply.
         self._thread_context[sender_addr] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
+            "references": msg_data.get("references", ""),
+            "from_name": msg_data.get("sender_name") or sender_addr,
+            "from_addr": sender_addr,
+            "date": msg_data.get("date", ""),
+            "body": body,
         }
 
         source = self.build_source(
@@ -648,7 +719,9 @@ class EmailAdapter(BasePlatformAdapter):
         original_msg_id = reply_to_msg_id or ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+            references = self._thread_references(ctx, original_msg_id)
+            if references:
+                msg["References"] = references
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
@@ -658,7 +731,8 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            smtp.starttls(context=ssl.create_default_context())
+            self._smtp_login(smtp)
             smtp.send_message(msg)
         finally:
             try:
@@ -761,7 +835,9 @@ class EmailAdapter(BasePlatformAdapter):
         original_msg_id = ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+            references = self._thread_references(ctx, original_msg_id)
+            if references:
+                msg["References"] = references
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
@@ -784,7 +860,8 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            smtp.starttls(context=ssl.create_default_context())
+            self._smtp_login(smtp)
             smtp.send_message(msg)
         finally:
             try:
@@ -841,7 +918,9 @@ class EmailAdapter(BasePlatformAdapter):
         original_msg_id = ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+            references = self._thread_references(ctx, original_msg_id)
+            if references:
+                msg["References"] = references
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
@@ -862,7 +941,8 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            smtp.starttls(context=ssl.create_default_context())
+            self._smtp_login(smtp)
             smtp.send_message(msg)
         finally:
             try:
