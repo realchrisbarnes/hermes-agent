@@ -674,6 +674,34 @@ def run_conversation(
                     task_id=effective_task_id,
                 )
                 if len(messages) >= _orig_len:
+                    if getattr(_compressor, "_last_compress_aborted", False):
+                        _err = getattr(
+                            _compressor,
+                            "_last_summary_error",
+                            "Automatic context compression limit reached.",
+                        )
+                        agent._flush_status_buffer()
+                        agent._vprint(f"{agent.log_prefix}❌ {_err}", force=True)
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 Start /new, reset this chat, "
+                            "or run /compress manually with a focus topic before retrying.",
+                            force=True,
+                        )
+                        logger.error(
+                            "%sPreflight compression stopped before provider call: %s",
+                            agent.log_prefix,
+                            _err,
+                        )
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "messages": messages,
+                            "completed": False,
+                            "api_calls": 0,
+                            "error": _err,
+                            "partial": True,
+                            "failed": True,
+                            "auto_compression_limit_reached": True,
+                        }
                     break  # Cannot compress further
                 # Compression created a new session — clear the history
                 # reference so _flush_messages_to_session_db writes ALL

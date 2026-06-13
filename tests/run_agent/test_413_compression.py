@@ -744,6 +744,89 @@ class TestPreflightCompression:
         # Smaller estimate must not overwrite the larger tracked value.
         assert agent.context_compressor.last_prompt_tokens == 160_000
 
+    def test_auto_compression_limit_aborts_without_running_compressor(self, agent):
+        """After the hard rail, unattended compression must stop instead of spiraling."""
+        messages = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "user", "content": "current question"},
+        ]
+        agent.context_compressor.compression_count = (
+            agent.context_compressor.auto_compression_hard_limit
+        )
+        events = []
+        agent.status_callback = lambda ev, msg: events.append((ev, msg))
+
+        with (
+            patch.object(agent.context_compressor, "compress") as mock_compress,
+            patch.object(agent, "_build_system_prompt", return_value="existing prompt"),
+        ):
+            compressed, prompt = agent._compress_context(messages, "system prompt")
+
+        mock_compress.assert_not_called()
+        assert compressed == messages
+        assert prompt == "You are helpful."
+        assert agent.context_compressor._last_compress_aborted is True
+        assert "Automatic context compression limit reached" in (
+            agent.context_compressor._last_summary_error
+        )
+        assert any("Automatic context compression limit reached" in msg for _, msg in events)
+
+    def test_preflight_auto_compression_limit_returns_before_provider_call(self, agent):
+        """A hard-rail preflight abort must not continue into provider calls."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor.compression_count = (
+            agent.context_compressor.auto_compression_hard_limit
+        )
+        big_history = []
+        for i in range(20):
+            big_history.append({"role": "user", "content": f"Message {i} padded text"})
+            big_history.append({"role": "assistant", "content": f"Response {i} padded text"})
+
+        with (
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=144_669),
+            patch.object(agent, "_persist_session") as mock_persist,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=big_history)
+
+        agent.client.chat.completions.create.assert_not_called()
+        mock_persist.assert_called_once()
+        assert result.get("failed") is True
+        assert result.get("auto_compression_limit_reached") is True
+        assert result.get("api_calls") == 0
+
+    def test_manual_compress_bypasses_auto_compression_limit(self, agent):
+        """The hard rail blocks unattended compaction, not explicit /compress."""
+        messages = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+            {"role": "user", "content": "current question"},
+        ]
+        compressed_messages = [{"role": "assistant", "content": "summary"}]
+        agent.context_compressor.compression_count = (
+            agent.context_compressor.auto_compression_hard_limit
+        )
+        agent._compression_feasibility_checked = True
+
+        with (
+            patch.object(
+                agent.context_compressor, "compress", return_value=compressed_messages
+            ) as mock_compress,
+            patch.object(agent, "_build_system_prompt", return_value="new prompt"),
+            patch("agent.conversation_compression.estimate_request_tokens_rough", return_value=42),
+        ):
+            compressed, prompt = agent._compress_context(
+                messages, "system prompt", force=True
+            )
+
+        mock_compress.assert_called_once()
+        assert compressed == compressed_messages
+        assert prompt == "new prompt"
+
 
 class TestToolResultPreflightCompression:
     """Compression should trigger when tool results push context past the threshold."""
