@@ -311,6 +311,33 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    _compressor = getattr(agent, "context_compressor", None)
+    if (
+        not force
+        and _compressor is not None
+        and getattr(_compressor, "auto_compression_limit_reached", lambda: False)()
+    ):
+        _err = getattr(
+            _compressor,
+            "auto_compression_limit_message",
+            lambda: "Automatic context compression limit reached.",
+        )()
+        try:
+            _compressor._last_compress_aborted = True
+            _compressor._last_summary_error = _err
+            _compressor._last_summary_dropped_count = 0
+            _compressor._last_summary_fallback_used = False
+        except Exception:
+            pass
+        logger.warning("auto compression skipped: %s", _err)
+        if getattr(agent, "_last_auto_compression_limit_warning", None) != _err:
+            agent._last_auto_compression_limit_warning = _err
+            agent._emit_warning(f"⚠ {_err}")
+        _existing_sp = getattr(agent, "_cached_system_prompt", None)
+        if not _existing_sp:
+            _existing_sp = agent._build_system_prompt(system_message)
+        return messages, _existing_sp
+
     # Lazy feasibility check — run the auxiliary-provider probe + context
     # length lookup just-in-time on the first compression attempt instead of
     # at AIAgent.__init__. Saves ~400ms cold off every short session that
@@ -604,9 +631,19 @@ def compress_context(
     except Exception as _me_err:
         logger.debug("memory manager on_session_switch (compression): %s", _me_err)
 
-    # Warn on repeated compressions (quality degrades with each pass)
+    # Warn on repeated compressions (quality degrades with each pass). At the
+    # hard limit, the *next* unattended compression attempt will be refused.
     _cc = agent.context_compressor.compression_count
-    if _cc >= 2:
+    _warn_at = getattr(agent.context_compressor, "auto_compression_warn_at", 3)
+    _hard_limit = getattr(agent.context_compressor, "auto_compression_hard_limit", 5)
+    if _cc >= _hard_limit:
+        agent._vprint(
+            f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
+            "automatic compression is now paused. Start /new or run "
+            "/compress manually with a focus topic before continuing.",
+            force=True,
+        )
+    elif _cc >= _warn_at:
         agent._vprint(
             f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
             f"accuracy may degrade. Consider /new to start fresh.",

@@ -162,6 +162,8 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+_AUTO_COMPRESSION_WARN_AT = 3
+_AUTO_COMPRESSION_HARD_LIMIT = 5
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
@@ -714,6 +716,8 @@ class ContextCompressor(ContextEngine):
             MINIMUM_CONTEXT_LENGTH,
         )
         self.compression_count = 0
+        self.auto_compression_warn_at = _AUTO_COMPRESSION_WARN_AT
+        self.auto_compression_hard_limit = _AUTO_COMPRESSION_HARD_LIMIT
 
         # Derive token budgets: ratio is relative to the threshold, not total context
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
@@ -781,6 +785,23 @@ class ContextCompressor(ContextEngine):
             else:
                 self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+
+    def auto_compression_limit_reached(self) -> bool:
+        """Return True when unattended auto-compression should stop.
+
+        Manual ``/compress`` passes ``force=True`` and may still run. The limit
+        prevents long gateway/CLI sessions from silently accumulating many
+        lossy summaries in a row.
+        """
+        return self.compression_count >= self.auto_compression_hard_limit
+
+    def auto_compression_limit_message(self) -> str:
+        return (
+            "Automatic context compression limit reached "
+            f"({self.compression_count}/{self.auto_compression_hard_limit}). "
+            "Start a fresh session with /new, reset this chat, or run /compress "
+            "manually with a focus topic before continuing."
+        )
 
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
