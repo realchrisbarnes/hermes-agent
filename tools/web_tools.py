@@ -168,6 +168,7 @@ def _get_backend() -> str:
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
+        ("xai", _is_backend_available("xai")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -241,6 +242,19 @@ def _is_backend_available(backend: str) -> bool:
         except Exception:
             return False
     return False
+
+
+EXTRACT_CAPABLE_BACKENDS = {"exa", "parallel", "firecrawl", "tavily"}
+
+
+def _configured_web_backend(capability: Optional[str] = None) -> str:
+    """Return the explicitly configured backend for a capability, if any."""
+    cfg = _load_web_config()
+    if capability:
+        specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
+        if specific:
+            return specific
+    return (cfg.get("backend") or "").lower().strip()
 
 
 def _ddgs_package_importable() -> bool:
@@ -1182,15 +1196,32 @@ async def web_extract_tool(
 
 
 # Convenience function to check Firecrawl credentials
-def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available."""
-    configured = _load_web_config().get("backend", "").lower().strip()
+def check_web_search_available() -> bool:
+    """Check whether the configured web search backend is available."""
+    configured = _configured_web_backend()
     if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai"}:
         return _is_backend_available(configured)
     return any(
         _is_backend_available(backend)
         for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai")
     )
+
+
+def check_web_extract_available() -> bool:
+    """Check whether native URL extraction is available.
+
+    Search-only backends such as ddgs, SearXNG, and Brave free search make
+    web_search usable, but they must not advertise native web_extract.
+    """
+    configured = _configured_web_backend("extract")
+    if configured:
+        return configured in EXTRACT_CAPABLE_BACKENDS and _is_backend_available(configured)
+    return any(_is_backend_available(backend) for backend in EXTRACT_CAPABLE_BACKENDS)
+
+
+def check_web_api_key() -> bool:
+    """Backward-compatible alias for generic web search availability."""
+    return check_web_search_available()
 
 
 def check_auxiliary_model() -> bool:
@@ -1358,7 +1389,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=check_web_api_key,
+    check_fn=check_web_search_available,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -1369,7 +1400,7 @@ registry.register(
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_available,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",

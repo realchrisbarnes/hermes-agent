@@ -5,7 +5,8 @@ Coverage:
   constructor failure recovery, return value verification, edge cases.
   _get_backend() — backend selection logic with env var combinations.
   _get_parallel_client() — Parallel client configuration, singleton caching.
-  check_web_api_key() — unified availability check across all web backends.
+  check_web_api_key() — backward-compatible web search availability check.
+  check_web_extract_available() — native extraction availability check.
 """
 
 import importlib
@@ -259,6 +260,8 @@ class TestBackendSelection:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "SEARXNG_URL",
+        "BRAVE_SEARCH_API_KEY",
     )
 
     def setup_method(self):
@@ -384,12 +387,27 @@ class TestBackendSelection:
              patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
             assert _get_backend() == "firecrawl"
 
-    def test_fallback_no_keys_defaults_to_firecrawl(self):
-        """No keys, no config → 'firecrawl' (will fail at client init)."""
+    def test_fallback_no_keys_uses_free_ddgs_when_available(self):
+        """No keys, no config, ddgs installed → 'ddgs' for free search."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._ddgs_package_importable", return_value=True):
+            assert _get_backend() == "ddgs"
+
+    def test_fallback_no_keys_without_free_backend_defaults_to_firecrawl(self):
+        """No keys and no free backend → 'firecrawl' for backward compatibility."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch("tools.web_tools._ddgs_package_importable", return_value=False):
             assert _get_backend() == "firecrawl"
+
+    def test_fallback_xai_credentials_selects_xai(self):
+        """No keyed/free backend but xAI credentials exist → 'xai'."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._ddgs_package_importable", return_value=False), \
+             patch("tools.web_tools._is_backend_available", side_effect=lambda backend: backend == "xai"):
+            assert _get_backend() == "xai"
 
     def test_invalid_config_falls_through_to_fallback(self):
         """web.backend=invalid → ignored, uses key-based fallback."""
@@ -581,6 +599,8 @@ class TestCheckWebApiKey:
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
         "TAVILY_API_KEY",
+        "SEARXNG_URL",
+        "BRAVE_SEARCH_API_KEY",
     )
 
     def setup_method(self):
@@ -624,10 +644,32 @@ class TestCheckWebApiKey:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
-    def test_no_keys_returns_false(self):
+    def test_no_keys_returns_true_for_free_ddgs_search(self):
         from tools.web_tools import check_web_api_key
         with patch("tools.web_tools._ddgs_package_importable", return_value=False):
             assert check_web_api_key() is False
+        with patch("tools.web_tools._ddgs_package_importable", return_value=True):
+            assert check_web_api_key() is True
+
+    def test_no_keys_and_no_free_backend_returns_false(self):
+        from tools.web_tools import check_web_api_key
+        with patch("tools.web_tools._ddgs_package_importable", return_value=False):
+            assert check_web_api_key() is False
+
+    def test_free_search_only_backend_does_not_advertise_native_extract(self):
+        from tools.web_tools import check_web_extract_available
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._ddgs_package_importable", return_value=True):
+            assert check_web_extract_available() is False
+
+    def test_extract_backend_requires_extract_capable_provider(self):
+        from tools.web_tools import check_web_extract_available
+        with patch("tools.web_tools._load_web_config", return_value={"extract_backend": "ddgs"}), \
+             patch("tools.web_tools._ddgs_package_importable", return_value=True):
+            assert check_web_extract_available() is False
+        with patch("tools.web_tools._load_web_config", return_value={"extract_backend": "firecrawl"}), \
+             patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
+            assert check_web_extract_available() is True
 
     def test_both_keys_returns_true(self):
         with patch.dict(os.environ, {
