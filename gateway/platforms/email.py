@@ -799,6 +799,8 @@ class EmailAdapter(BasePlatformAdapter):
                     imap.logout()
                 except Exception:
                     pass
+        except TimeoutError as e:
+            logger.info("[Email] IMAP fetch timed out; will retry next poll: %s", e)
         except Exception as e:
             logger.error("[Email] IMAP fetch error: %s", e)
         return results
