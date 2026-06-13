@@ -131,6 +131,28 @@ def _doctor_tool_availability_detail(toolset: str) -> str:
     return ""
 
 
+def _doctor_required_api_disabled(unavailable: list[dict]) -> list[dict]:
+    """Unavailable API-backed toolsets that should become final doctor issues.
+
+    Default-off toolsets stay visible as warnings, but they are opt-in
+    capabilities and should not make a healthy base install look broken.
+    """
+    try:
+        from hermes_cli.tools_config import _DEFAULT_OFF_TOOLSETS
+        default_off = set(_DEFAULT_OFF_TOOLSETS)
+    except Exception:
+        default_off = set()
+
+    required = []
+    for item in unavailable:
+        if not (item.get("missing_vars") or item.get("env_vars")):
+            continue
+        if item.get("name") in default_off:
+            continue
+        required.append(item)
+    return required
+
+
 def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
     """Adjust runtime-gated tool availability for doctor diagnostics."""
     updated_available = list(available)
@@ -1650,6 +1672,13 @@ def run_doctor(args):
                     [],
                 )
             if r.status_code == 401:
+                if is_oauth:
+                    return _ConnectivityResult(
+                        "Anthropic API",
+                        [(color("⚠", Colors.YELLOW), "Anthropic API",
+                          color("(OAuth token cannot be verified by direct API probe)", Colors.DIM))],
+                        [],
+                    )
                 return _ConnectivityResult(
                     "Anthropic API",
                     [(color("✗", Colors.RED), "Anthropic API",
@@ -1971,8 +2000,10 @@ def run_doctor(args):
             else:
                 check_warn(item["name"], "(system dependency not met)")
 
-        # Count disabled tools with API key requirements
-        api_disabled = [u for u in unavailable if (u.get("missing_vars") or u.get("env_vars"))]
+        # Count only missing credentials for required/default toolsets. Opt-in
+        # default-off toolsets still get warning rows above, without making a
+        # healthy base install fail doctor.
+        api_disabled = _doctor_required_api_disabled(unavailable)
         if api_disabled:
             issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
     except Exception as e:
