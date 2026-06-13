@@ -35,14 +35,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ── Activate venv ───────────────────────────────────────────────────────────
 VENV=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    VENV="$candidate"
-    break
+  if [ ! -f "$candidate/bin/python" ]; then
+    continue
+  fi
+  if "$candidate/bin/python" - <<'PY' >/dev/null 2>&1; then
+import pytest  # noqa: F401
+PY
+      VENV="$candidate"
+      break
   fi
 done
 
 if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+  echo "error: no virtualenv with pytest found in $REPO_ROOT/.venv, $REPO_ROOT/venv, or $HOME/.hermes/hermes-agent/venv" >&2
   exit 1
 fi
 

@@ -907,6 +907,18 @@ class TestFetchNewMessages(unittest.TestCase):
 
         self.assertEqual(results, [])
 
+    def test_fetch_timeout_is_retryable_not_error_log(self):
+        """Transient IMAP read timeouts are a retryable empty poll, not a hard error."""
+        adapter = self._make_adapter()
+
+        with self.assertLogs("gateway.platforms.email", level="INFO") as logs:
+            with patch("imaplib.IMAP4_SSL", side_effect=TimeoutError("The read operation timed out")):
+                results = adapter._fetch_new_messages()
+
+        self.assertEqual(results, [])
+        self.assertTrue(any("IMAP fetch timed out" in msg for msg in logs.output))
+        self.assertFalse(any("ERROR" in msg for msg in logs.output))
+
     def test_fetch_extracts_sender_name(self):
         """Sender name should be extracted from 'Name <addr>' format."""
         adapter = self._make_adapter()
