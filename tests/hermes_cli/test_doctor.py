@@ -51,6 +51,19 @@ class TestProviderEnvDetection:
         assert not _has_provider_env_config(content)
 
 
+def test_doctor_required_api_disabled_ignores_default_off_toolsets():
+    missing = [
+        {"name": "discord", "env_vars": ["DISCORD_BOT_TOKEN"]},
+        {"name": "discord_admin", "env_vars": ["DISCORD_BOT_TOKEN"]},
+        {"name": "moa", "env_vars": ["OPENROUTER_API_KEY"]},
+        {"name": "custom_required", "env_vars": ["CUSTOM_REQUIRED_API_KEY"]},
+    ]
+
+    required = doctor_mod._doctor_required_api_disabled(missing)
+
+    assert required == [{"name": "custom_required", "env_vars": ["CUSTOM_REQUIRED_API_KEY"]}]
+
+
 class TestDoctorEnvFileEncoding:
     """Regression for #18637 (bug 3): `hermes doctor` crashed on Windows
     Chinese locale (GBK) because `.env` was read with Path.read_text() which
@@ -775,6 +788,56 @@ def test_run_doctor_dashscope_retries_china_endpoint_after_intl_unauthorized(mon
         url == "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
         for url, _, _ in calls
     )
+
+
+def test_run_doctor_anthropic_oauth_unauthorized_is_advisory(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    (home / ".env").write_text("ANTHROPIC_TOKEN=sk-ant-oat-test\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat-test")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except ImportError:
+        pass
+
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append((url, headers or {}, timeout))
+        return types.SimpleNamespace(status_code=401, text="unauthorized")
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    assert "Anthropic API" in out
+    assert "OAuth token cannot be verified by direct API probe" in out
+    assert "invalid API key" not in out
+    assert "Check ANTHROPIC_API_KEY" not in out
+    assert calls and calls[0][1].get("Authorization") == "Bearer sk-ant-oat-test"
 
 
 @pytest.mark.parametrize("base_url", [None, "https://opencode.ai/zen/go/v1"])
