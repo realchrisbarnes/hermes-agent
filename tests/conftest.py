@@ -319,6 +319,12 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "TELEGRAM_REQUIRE_MENTION",
     "WHATSAPP_REQUIRE_MENTION",
+    "BLUEBUBBLES_REQUIRE_MENTION",
+    "BLUEBUBBLES_MENTION_PATTERNS",
+    "BLUEBUBBLES_DM_ONLY",
+    "BLUEBUBBLES_HOME_CHANNEL",
+    "BLUEBUBBLES_HOME_CHANNEL_THREAD_ID",
+    "BLUEBUBBLES_HOME_CHANNEL_NAME",
     "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
 })
@@ -358,6 +364,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # Credential env vars are scrubbed above, but macOS Keychain credentials
+    # live outside the process environment. Keep normal tests hermetic; the
+    # focused keychain tests opt back in with mocked subprocess responses.
+    monkeypatch.setenv("HERMES_DISABLE_CLAUDE_CODE_KEYCHAIN", "1")
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.

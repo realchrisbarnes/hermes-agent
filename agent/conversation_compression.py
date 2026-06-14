@@ -51,6 +51,22 @@ COMPACTION_STATUS = (
 )
 
 
+def _auto_compression_limit_reached(compressor: Any) -> bool:
+    """Return True only when the compressor explicitly reports a hard stop."""
+    checker = getattr(compressor, "auto_compression_limit_reached", None)
+    if not callable(checker):
+        return False
+    return checker() is True
+
+
+def _int_attr(obj: Any, name: str, default: int) -> int:
+    """Read an integer attribute without accepting placeholder mock objects."""
+    value = getattr(obj, name, default)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return default
+
+
 def _compression_lock_holder(agent: Any) -> str:
     """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.
 
@@ -315,13 +331,15 @@ def compress_context(
     if (
         not force
         and _compressor is not None
-        and getattr(_compressor, "auto_compression_limit_reached", lambda: False)()
+        and _auto_compression_limit_reached(_compressor)
     ):
         _err = getattr(
             _compressor,
             "auto_compression_limit_message",
             lambda: "Automatic context compression limit reached.",
         )()
+        if not isinstance(_err, str):
+            _err = "Automatic context compression limit reached."
         try:
             _compressor._last_compress_aborted = True
             _compressor._last_summary_error = _err
@@ -623,9 +641,9 @@ def compress_context(
 
     # Warn on repeated compressions (quality degrades with each pass). At the
     # hard limit, the *next* unattended compression attempt will be refused.
-    _cc = agent.context_compressor.compression_count
-    _warn_at = getattr(agent.context_compressor, "auto_compression_warn_at", 3)
-    _hard_limit = getattr(agent.context_compressor, "auto_compression_hard_limit", 5)
+    _cc = _int_attr(agent.context_compressor, "compression_count", 0)
+    _warn_at = _int_attr(agent.context_compressor, "auto_compression_warn_at", 3)
+    _hard_limit = _int_attr(agent.context_compressor, "auto_compression_hard_limit", 5)
     if _cc >= _hard_limit:
         agent._vprint(
             f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "

@@ -870,6 +870,9 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     """
     if platform.system() != "Darwin":
         return None
+    if os.environ.get("HERMES_DISABLE_CLAUDE_CODE_KEYCHAIN") == "1":
+        logger.debug("Keychain: disabled by HERMES_DISABLE_CLAUDE_CODE_KEYCHAIN")
+        return None
 
     try:
         # Read the "Claude Code-credentials" generic password entry
@@ -890,13 +893,17 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
         return None
 
+    if not isinstance(result.stdout, str):
+        logger.debug("Keychain: credentials payload stdout is not text")
+        return None
+
     raw = result.stdout.strip()
     if not raw:
         return None
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 

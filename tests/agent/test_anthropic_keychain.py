@@ -3,11 +3,18 @@
 import json
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 
 from agent.anthropic_adapter import (
     _read_claude_code_credentials_from_keychain,
     read_claude_code_credentials,
 )
+
+
+@pytest.fixture(autouse=True)
+def _allow_mocked_keychain(monkeypatch, _hermetic_environment):
+    monkeypatch.delenv("HERMES_DISABLE_CLAUDE_CODE_KEYCHAIN", raising=False)
 
 
 class TestReadClaudeCodeCredentialsFromKeychain:
