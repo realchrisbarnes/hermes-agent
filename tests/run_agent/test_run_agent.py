@@ -180,6 +180,55 @@ def test_aiagent_reuses_existing_errors_log_handler():
             root_logger.addHandler(handler)
 
 
+def test_aiagent_logging_uses_current_hermes_home_after_import(monkeypatch, tmp_path):
+    """AIAgent logging must honor the active HERMES_HOME, not import-time state."""
+    import hermes_logging
+
+    root_logger = logging.getLogger()
+    original_handlers = list(root_logger.handlers)
+    isolated_home = tmp_path / "current-hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(isolated_home))
+    monkeypatch.setattr(hermes_logging, "_logging_initialized", False)
+
+    try:
+        for handler in list(root_logger.handlers):
+            root_logger.removeHandler(handler)
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        error_handlers = [
+            handler for handler in root_logger.handlers
+            if isinstance(handler, RotatingFileHandler)
+            and Path(handler.baseFilename).name == "errors.log"
+        ]
+        assert error_handlers
+        assert {
+            Path(handler.baseFilename).resolve().parent.parent
+            for handler in error_handlers
+        } == {isolated_home.resolve()}
+    finally:
+        for handler in list(root_logger.handlers):
+            root_logger.removeHandler(handler)
+            if handler not in original_handlers:
+                handler.close()
+        for handler in original_handlers:
+            root_logger.addHandler(handler)
+
+
 class TestProviderModelNormalization:
     def test_aiagent_strips_matching_native_provider_prefix(self):
         with (
