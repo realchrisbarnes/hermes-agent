@@ -6,6 +6,47 @@ This wrapper should behave like the installed `hermes` command, including
 subcommands such as `gateway`, `cron`, and `doctor`.
 """
 
+import os
+import subprocess
+import sys
+
+
+def _reexec_supported_venv_python() -> None:
+    if sys.version_info >= (3, 11):
+        return
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(repo_root, ".venv", "bin", "python"),
+        os.path.join(repo_root, "venv", "bin", "python"),
+        os.path.join(repo_root, ".venv", "Scripts", "python.exe"),
+        os.path.join(repo_root, "venv", "Scripts", "python.exe"),
+    )
+    current = os.path.realpath(sys.executable)
+
+    for candidate in candidates:
+        if not os.path.exists(candidate) or os.path.realpath(candidate) == current:
+            continue
+        probe = subprocess.run(
+            [
+                candidate,
+                "-c",
+                "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if probe.returncode == 0:
+            os.execv(candidate, [candidate, os.path.abspath(__file__), *sys.argv[1:]])
+
+    sys.stderr.write(
+        "Hermes requires Python 3.11+. Run `.venv/bin/python ./hermes` "
+        "or reinstall Hermes so the launcher points at a supported virtualenv.\n"
+    )
+    raise SystemExit(1)
+
+
 if __name__ == "__main__":
+    _reexec_supported_venv_python()
     from hermes_cli.main import main
     main()
