@@ -134,7 +134,7 @@ def _doctor_tool_availability_detail(toolset: str) -> str:
 def _doctor_required_api_disabled(unavailable: list[dict]) -> list[dict]:
     """Unavailable API-backed toolsets that should become final doctor issues.
 
-    Default-off toolsets stay visible as warnings, but they are opt-in
+    Default-off toolsets stay visible as advisories, but they are opt-in
     capabilities and should not make a healthy base install look broken.
     """
     try:
@@ -206,6 +206,9 @@ def check_ok(text: str, detail: str = ""):
 
 def check_warn(text: str, detail: str = ""):
     print(f"  {color('⚠', Colors.YELLOW)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+
+def check_advisory(text: str, detail: str = ""):
+    print(f"  {color('•', Colors.DIM)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
 def check_fail(text: str, detail: str = ""):
     print(f"  {color('✗', Colors.RED)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
@@ -686,7 +689,7 @@ def run_doctor(args):
             __import__(module)
             check_ok(name, "(optional)")
         except ImportError:
-            check_warn(name, "(optional, not installed)")
+            check_advisory(name, "(optional, not installed)")
     
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
@@ -1107,13 +1110,13 @@ def run_doctor(args):
         if nous_status.get("logged_in"):
             check_ok("Nous Portal auth", "(logged in)")
         else:
-            check_warn("Nous Portal auth", "(not logged in)")
+            check_advisory("Nous Portal auth", "(not logged in)")
 
         codex_status = get_codex_auth_status()
         if codex_status.get("logged_in"):
             check_ok("OpenAI Codex auth", "(logged in)")
         else:
-            check_warn("OpenAI Codex auth", "(not logged in)")
+            check_advisory("OpenAI Codex auth", "(not logged in)")
             if codex_status.get("error"):
                 check_info(codex_status["error"])
             # Native OAuth uses Hermes' own device-code flow — the Codex CLI is
@@ -1139,14 +1142,14 @@ def run_doctor(args):
             suffix = f" ({', '.join(pieces)})" if pieces else ""
             check_ok("Google Gemini OAuth", f"(logged in{suffix})")
         else:
-            check_warn("Google Gemini OAuth", "(not logged in)")
+            check_advisory("Google Gemini OAuth", "(not logged in)")
 
         minimax_status = get_minimax_oauth_auth_status()
         if minimax_status.get("logged_in"):
             region = minimax_status.get("region", "global")
             check_ok("MiniMax OAuth", f"(logged in, region={region})")
         else:
-            check_warn("MiniMax OAuth", "(not logged in)")
+            check_advisory("MiniMax OAuth", "(not logged in)")
     except Exception as e:
         check_warn("Auth provider status", f"(could not check: {e})")
 
@@ -1158,7 +1161,7 @@ def run_doctor(args):
         if xai_oauth_status.get("logged_in"):
             check_ok("xAI OAuth", "(logged in)")
         else:
-            check_warn("xAI OAuth", "(not logged in)")
+            check_advisory("xAI OAuth", "(not logged in)")
             if xai_oauth_status.get("error"):
                 check_info(xai_oauth_status["error"])
     except Exception:
@@ -1719,7 +1722,7 @@ def run_doctor(args):
         if not key:
             return _ConnectivityResult(
                 "OpenRouter API",
-                [(color("⚠", Colors.YELLOW), "OpenRouter API",
+                [(color("•", Colors.DIM), "OpenRouter API",
                   color("(not configured)", Colors.DIM))],
                 [],
             )
@@ -1827,7 +1830,7 @@ def run_doctor(args):
                 if is_oauth:
                     return _ConnectivityResult(
                         "Anthropic API",
-                        [(color("⚠", Colors.YELLOW), "Anthropic API",
+                        [(color("•", Colors.DIM), "Anthropic API",
                           color("(OAuth token cannot be verified by direct API probe)", Colors.DIM))],
                         [],
                     )
@@ -2139,6 +2142,8 @@ def run_doctor(args):
         
         available, unavailable = check_tool_availability()
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
+        api_disabled = _doctor_required_api_disabled(unavailable)
+        api_disabled_names = {item.get("name") for item in api_disabled}
         
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
@@ -2146,16 +2151,16 @@ def run_doctor(args):
         
         for item in unavailable:
             env_vars = item.get("missing_vars") or item.get("env_vars") or []
+            row = check_warn if item.get("name") in api_disabled_names else check_advisory
             if env_vars:
                 vars_str = ", ".join(env_vars)
-                check_warn(item["name"], f"(missing {vars_str})")
+                row(item["name"], f"(missing {vars_str})")
             else:
-                check_warn(item["name"], "(system dependency not met)")
+                row(item["name"], "(system dependency not met)")
 
         # Count only missing credentials for required/default toolsets. Opt-in
-        # default-off toolsets still get warning rows above, without making a
+        # default-off toolsets still get advisory rows above, without making a
         # healthy base install fail doctor.
-        api_disabled = _doctor_required_api_disabled(unavailable)
         if api_disabled:
             issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
     except Exception as e:
@@ -2200,7 +2205,7 @@ def run_doctor(args):
     elif _gh_authenticated():
         check_ok("GitHub authenticated via gh CLI", "(full API access — no GITHUB_TOKEN needed)")
     else:
-        check_warn("No GITHUB_TOKEN", f"(60 req/hr rate limit — set in {_DHH}/.env for better rates)")
+        check_advisory("No GITHUB_TOKEN", f"(60 req/hr rate limit — set in {_DHH}/.env for better rates)")
 
     _section("Memory Provider")
     _active_memory_provider = ""
