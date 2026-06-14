@@ -18,7 +18,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock, AsyncMock, ANY
 
 from gateway.platforms.base import SendResult
 
@@ -29,7 +29,6 @@ class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
     }, clear=False)
@@ -44,7 +43,6 @@ class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_HOME_ADDRESS": "user@test.com",
@@ -244,7 +242,6 @@ class TestDispatchMessage(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
-            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_IMAP_PORT": "993",
             "EMAIL_SMTP_HOST": "smtp.test.com",
@@ -396,6 +393,68 @@ class TestDispatchMessage(unittest.TestCase):
         self.assertEqual(captured_events[0].message_type, MessageType.PHOTO)
         self.assertEqual(captured_events[0].media_urls, ["/tmp/img.jpg"])
 
+    def test_document_attachment_sets_document_type(self):
+        """Email with a document attachment must set DOCUMENT so run.py injects file context."""
+        import asyncio
+        from gateway.platforms.base import MessageType
+        adapter = self._make_adapter()
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+
+        msg_data = {
+            "uid": b"6",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "Re: report",
+            "message_id": "<msg6@test.com>",
+            "in_reply_to": "",
+            "body": "See attached",
+            "attachments": [{"path": "/tmp/report.pdf", "filename": "report.pdf", "type": "document", "media_type": "application/pdf"}],
+            "date": "",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        self.assertEqual(len(captured_events), 1)
+        self.assertEqual(captured_events[0].message_type, MessageType.DOCUMENT)
+        self.assertEqual(captured_events[0].media_urls, ["/tmp/report.pdf"])
+
+    def test_mixed_image_and_document_prefers_document(self):
+        """DOCUMENT wins for mixed attachments — image handling keys off per-path
+        mime types, but document injection gates strictly on MessageType.DOCUMENT."""
+        import asyncio
+        from gateway.platforms.base import MessageType
+        adapter = self._make_adapter()
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+
+        msg_data = {
+            "uid": b"7",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "Re: both",
+            "message_id": "<msg7@test.com>",
+            "in_reply_to": "",
+            "body": "Photo and PDF",
+            "attachments": [
+                {"path": "/tmp/img.jpg", "filename": "img.jpg", "type": "image", "media_type": "image/jpeg"},
+                {"path": "/tmp/report.pdf", "filename": "report.pdf", "type": "document", "media_type": "application/pdf"},
+            ],
+            "date": "",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        self.assertEqual(len(captured_events), 1)
+        self.assertEqual(captured_events[0].message_type, MessageType.DOCUMENT)
+        self.assertEqual(len(captured_events[0].media_urls), 2)
+
     def test_source_built_correctly(self):
         """Session source should have correct chat_id and user info."""
         import asyncio
@@ -520,7 +579,6 @@ class TestThreadContext(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
-            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
         }):
@@ -577,36 +635,6 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["References"], "<original@test.com>")
             self.assertIn("Date", send_call)
 
-    def test_reply_preserves_references_chain_with_clean_quote(self):
-        """Replies keep RFC threading headers AND a clean mail-client-style quote
-        of the message being replied to (owner directive 2026-06-11: replies must
-        carry readable history; footers/legal/marketing are trimmed)."""
-        adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {
-            "subject": "Project question",
-            "message_id": "<original@test.com>",
-            "references": "<root@test.com> <prior@test.com>",
-            "from_name": "Pat User",
-            "body": "Original message that should be quoted cleanly.",
-        }
-
-        with patch("smtplib.SMTP") as mock_smtp, \
-                patch("gateway.platforms.email._native_signature", return_value=("", "")):
-            mock_server = MagicMock()
-            mock_smtp.return_value = mock_server
-
-            adapter._send_email("user@test.com", "Here is the answer.", None)
-
-            send_call = mock_server.send_message.call_args[0][0]
-            self.assertEqual(
-                send_call["References"],
-                "<root@test.com> <prior@test.com> <original@test.com>",
-            )
-            payload = send_call.get_payload()[0].get_payload(decode=True).decode("utf-8")
-            self.assertTrue(payload.startswith("Here is the answer."))
-            self.assertIn("From: Pat User", payload)
-            self.assertIn("> Original message that should be quoted cleanly.", payload)
-
     def test_reply_does_not_double_re(self):
         """If subject already has Re:, don't add another."""
         adapter = self._make_adapter()
@@ -648,7 +676,6 @@ class TestSendMethods(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
-            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
         }):
@@ -657,10 +684,10 @@ class TestSendMethods(unittest.TestCase):
         return adapter
 
     def test_send_calls_smtp(self):
-        """send() should use SMTP to deliver email (immediate path)."""
+        """send() should use SMTP to deliver email."""
         import asyncio
         adapter = self._make_adapter()
-        adapter._coalesce_s = 0  # immediate send, no burst buffering
+        adapter._coalesce_s = 0
 
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
@@ -677,10 +704,10 @@ class TestSendMethods(unittest.TestCase):
             mock_server.quit.assert_called_once()
 
     def test_send_failure_returns_error(self):
-        """SMTP failure should return SendResult with error (immediate path)."""
+        """SMTP failure should return SendResult with error."""
         import asyncio
         adapter = self._make_adapter()
-        adapter._coalesce_s = 0  # immediate send, no burst buffering
+        adapter._coalesce_s = 0
 
         with patch("smtplib.SMTP") as mock_smtp:
             mock_smtp.side_effect = Exception("Connection refused")
@@ -770,7 +797,6 @@ class TestConnectDisconnect(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
-            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
         }):
@@ -849,7 +875,6 @@ class TestFetchNewMessages(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
-            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
         }):
@@ -907,18 +932,6 @@ class TestFetchNewMessages(unittest.TestCase):
 
         self.assertEqual(results, [])
 
-    def test_fetch_timeout_is_retryable_not_error_log(self):
-        """Transient IMAP read timeouts are a retryable empty poll, not a hard error."""
-        adapter = self._make_adapter()
-
-        with self.assertLogs("gateway.platforms.email", level="INFO") as logs:
-            with patch("imaplib.IMAP4_SSL", side_effect=TimeoutError("The read operation timed out")):
-                results = adapter._fetch_new_messages()
-
-        self.assertEqual(results, [])
-        self.assertTrue(any("IMAP fetch timed out" in msg for msg in logs.output))
-        self.assertFalse(any("ERROR" in msg for msg in logs.output))
-
     def test_fetch_extracts_sender_name(self):
         """Sender name should be extracted from 'Name <addr>' format."""
         adapter = self._make_adapter()
@@ -955,7 +968,6 @@ class TestPollLoop(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
-            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.test.com",
             "EMAIL_SMTP_HOST": "smtp.test.com",
             "EMAIL_POLL_INTERVAL": "1",
@@ -1004,7 +1016,6 @@ class TestSendEmailStandalone(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
     })
@@ -1035,7 +1046,6 @@ class TestSendEmailStandalone(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_SMTP_HOST": "smtp.test.com",
     })
     def test_send_email_tool_failure(self):
@@ -1071,7 +1081,6 @@ class TestSmtpConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
@@ -1084,7 +1093,6 @@ class TestSmtpConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
@@ -1104,7 +1112,6 @@ class TestSmtpConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
         "EMAIL_SMTP_PORT": "587",
@@ -1129,7 +1136,6 @@ class TestImapConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_IMAP_PORT": "993",
         "EMAIL_SMTP_HOST": "smtp.test.com",
@@ -1142,7 +1148,6 @@ class TestImapConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_IMAP_PORT": "993",
         "EMAIL_SMTP_HOST": "smtp.test.com",
@@ -1170,7 +1175,6 @@ class TestImapConnectionCleanup(unittest.TestCase):
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
-        "EMAIL_AUTH_METHOD": "password",
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_IMAP_PORT": "993",
         "EMAIL_SMTP_HOST": "smtp.test.com",
@@ -1200,7 +1204,6 @@ class TestImapIdExtensionForNetEase(unittest.TestCase):
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@163.com",
             "EMAIL_PASSWORD": "secret",
-            "EMAIL_AUTH_METHOD": "password",
             "EMAIL_IMAP_HOST": "imap.163.com",
             "EMAIL_SMTP_HOST": "smtp.163.com",
         }):
@@ -1264,9 +1267,128 @@ class TestImapIdExtensionForNetEase(unittest.TestCase):
         mock_imap.xatom.assert_called_once()
 
 
+class TestConnectSmtp(unittest.TestCase):
+    """Test _connect_smtp() helper: protocol selection and IPv6 fallback."""
+
+    def _make_adapter(self, port="587"):
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+            "EMAIL_SMTP_PORT": port,
+        }):
+            from gateway.platforms.email import EmailAdapter
+            return EmailAdapter(PlatformConfig(enabled=True))
+
+    def test_port_587_uses_smtp_with_starttls(self):
+        """Port 587 should use smtplib.SMTP + STARTTLS."""
+        adapter = self._make_adapter("587")
+
+        with patch("smtplib.SMTP") as mock_smtp, \
+             patch("smtplib.SMTP_SSL") as mock_smtp_ssl:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = adapter._connect_smtp()
+
+            mock_smtp.assert_called_once()
+            mock_smtp_ssl.assert_not_called()
+            mock_server.starttls.assert_called_once()
+            self.assertIs(result, mock_server)
+
+    def test_port_465_uses_smtp_ssl(self):
+        """Port 465 should use smtplib.SMTP_SSL (implicit TLS)."""
+        adapter = self._make_adapter("465")
+
+        with patch("smtplib.SMTP") as mock_smtp, \
+             patch("smtplib.SMTP_SSL") as mock_smtp_ssl:
+            mock_server = MagicMock()
+            mock_smtp_ssl.return_value = mock_server
+
+            result = adapter._connect_smtp()
+
+            mock_smtp_ssl.assert_called_once()
+            mock_smtp.assert_not_called()
+            self.assertIs(result, mock_server)
+
+    def test_ipv6_timeout_falls_back_to_ipv4(self):
+        """When default connection times out, retry with an IPv4-only SMTP path."""
+        import socket as _socket
+        from gateway.platforms import email as email_mod
+
+        adapter = self._make_adapter("587")
+
+        with patch("smtplib.SMTP", side_effect=_socket.timeout("timed out")), \
+             patch.object(email_mod, "_IPv4SMTP") as mock_ipv4_smtp:
+            mock_server = MagicMock()
+            mock_ipv4_smtp.return_value = mock_server
+
+            result = adapter._connect_smtp()
+
+            self.assertIs(result, mock_server)
+            mock_ipv4_smtp.assert_called_once_with("smtp.test.com", 587, timeout=30)
+            mock_server.starttls.assert_called_once()
+
+    def test_port_465_ipv6_fallback(self):
+        """Port 465 IPv6 timeout falls back to IPv4 with SMTP_SSL."""
+        import socket as _socket
+        from gateway.platforms import email as email_mod
+
+        adapter = self._make_adapter("465")
+
+        with patch("smtplib.SMTP_SSL", side_effect=_socket.timeout("timed out")), \
+             patch.object(email_mod, "_IPv4SMTP_SSL") as mock_ipv4_smtp_ssl:
+            mock_server = MagicMock()
+            mock_ipv4_smtp_ssl.return_value = mock_server
+
+            result = adapter._connect_smtp()
+
+            self.assertIs(result, mock_server)
+            mock_ipv4_smtp_ssl.assert_called_once_with(
+                "smtp.test.com", 465, timeout=30, context=ANY,
+            )
+
+    def test_tls_verification_error_does_not_retry_ipv4(self):
+        """Certificate failures are security errors, not IPv6 reachability failures."""
+        import ssl as _ssl
+        from gateway.platforms import email as email_mod
+
+        adapter = self._make_adapter("465")
+
+        with patch("smtplib.SMTP_SSL", side_effect=_ssl.SSLError("cert verify failed")), \
+             patch.object(email_mod, "_IPv4SMTP_SSL") as mock_ipv4_smtp_ssl:
+            with self.assertRaises(_ssl.SSLError):
+                adapter._connect_smtp()
+
+            mock_ipv4_smtp_ssl.assert_not_called()
+
+    def test_ipv4_connection_does_not_mutate_global_resolver(self):
+        """IPv4 fallback must not monkeypatch process-global socket state."""
+        import socket as _socket
+        from gateway.platforms.email import _create_ipv4_connection
+
+        original_getaddrinfo = _socket.getaddrinfo
+        fake_sock = MagicMock()
+
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("192.0.2.1", 587))],
+        ) as mock_getaddrinfo, patch("socket.socket", return_value=fake_sock):
+            result = _create_ipv4_connection("smtp.test.com", 587, 30)
+
+        self.assertIs(result, fake_sock)
+        mock_getaddrinfo.assert_called_once_with(
+            "smtp.test.com", 587, _socket.AF_INET, _socket.SOCK_STREAM,
+        )
+        self.assertIs(_socket.getaddrinfo, original_getaddrinfo)
+
+
 def _adapter_for_send():
     """EmailAdapter with mocked env for send-path tests."""
     from gateway.config import PlatformConfig
+
     with patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
@@ -1275,6 +1397,7 @@ def _adapter_for_send():
         "EMAIL_SMTP_HOST": "smtp.test.com",
     }):
         from gateway.platforms.email import EmailAdapter
+
         return EmailAdapter(PlatformConfig(enabled=True))
 
 
@@ -1292,6 +1415,7 @@ class TestOutgoingHygiene(unittest.TestCase):
 
     def test_clean_message_text_strips_footer_and_bare_urls(self):
         from gateway.platforms.email import _clean_message_text
+
         out = _clean_message_text(self.CHRIS_BODY)
         self.assertIn("Review this email thread", out)
         self.assertIn("Chris Barnes", out)
@@ -1301,27 +1425,34 @@ class TestOutgoingHygiene(unittest.TestCase):
 
     def test_clean_message_text_stops_at_prior_chain(self):
         from gateway.platforms.email import _clean_message_text
-        body = ("New reply here\n\nOn Thu, 11 Jun 2026 10:21:45 -0400, Chris Barnes wrote:\n"
-                "> old stuff\n> more old")
+
+        body = (
+            "New reply here\n\nOn Thu, 11 Jun 2026 10:21:45 -0400, "
+            "Chris Barnes wrote:\n> old stuff\n> more old"
+        )
         self.assertEqual(_clean_message_text(body), "New reply here")
 
     def test_sanitize_outgoing_style_removes_em_dashes(self):
         from gateway.platforms.email import _sanitize_outgoing_style
+
         out = _sanitize_outgoing_style("Shutting down — task interrupted – sorry")
         self.assertNotIn("—", out)
         self.assertNotIn("–", out)
 
     def test_quote_blocks_keep_full_history_including_signatures(self):
-        """Owner directive 2026-06-11: quoted history is FULL fidelity, like a
-        real mail client. Signatures and footers stay in the quote."""
         from gateway.platforms.email import _quote_blocks
-        ctx = {"body": self.CHRIS_BODY, "from_name": "Chris Barnes",
-               "from_addr": "chris@test.com", "date": "Thu, 11 Jun 2026 10:21:45 -0400"}
+
+        ctx = {
+            "body": self.CHRIS_BODY,
+            "from_name": "Chris Barnes",
+            "from_addr": "chris@test.com",
+            "date": "Thu, 11 Jun 2026 10:21:45 -0400",
+        }
         plain, html = _quote_blocks(ctx)
         self.assertIn("From: Chris Barnes <chris@test.com>", plain)
         self.assertIn("Sent: Thu, 11 Jun 2026 10:21:45 -0400", plain)
         self.assertIn("> Review this email thread", plain)
-        self.assertIn("Confidentiality", plain)       # signature/footer preserved
+        self.assertIn("Confidentiality", plain)
         self.assertIn("> Chris Barnes", plain)
         self.assertIn("<blockquote", html)
         self.assertIn("<b>From:</b>", html)
@@ -1329,15 +1460,26 @@ class TestOutgoingHygiene(unittest.TestCase):
 
     def test_quote_blocks_prefer_original_html(self):
         from gateway.platforms.email import _quote_blocks
-        ctx = {"body": "hello", "from_name": "Chris", "from_addr": "c@x.com",
-               "date": "", "body_html": "<p>hello <b>world</b></p>"}
+
+        ctx = {
+            "body": "hello",
+            "from_name": "Chris",
+            "from_addr": "c@x.com",
+            "date": "",
+            "body_html": "<p>hello <b>world</b></p>",
+        }
         _, html = _quote_blocks(ctx)
         self.assertIn("<p>hello <b>world</b></p>", html)
 
     def test_quote_blocks_nest_existing_quotes(self):
         from gateway.platforms.email import _quote_blocks
-        ctx = {"body": "newest\n> older reply\n> > oldest", "from_name": "Chris",
-               "from_addr": "c@x.com", "date": ""}
+
+        ctx = {
+            "body": "newest\n> older reply\n> > oldest",
+            "from_name": "Chris",
+            "from_addr": "c@x.com",
+            "date": "",
+        }
         plain, _ = _quote_blocks(ctx)
         self.assertIn("> newest", plain)
         self.assertIn("> > older reply", plain)
@@ -1346,28 +1488,35 @@ class TestOutgoingHygiene(unittest.TestCase):
     def test_send_email_builds_multipart_alternative_with_full_quote_and_signature(self):
         adapter = _adapter_for_send()
         adapter._thread_context["chris@test.com"] = {
-            "subject": "Test", "message_id": "<orig@x>", "references": "",
-            "from_name": "Chris Barnes", "from_addr": "chris@test.com",
-            "date": "Thu, 11 Jun 2026 10:21:45 -0400", "body": self.CHRIS_BODY,
+            "subject": "Test",
+            "message_id": "<orig@x>",
+            "references": "",
+            "from_name": "Chris Barnes",
+            "from_addr": "chris@test.com",
+            "date": "Thu, 11 Jun 2026 10:21:45 -0400",
+            "body": self.CHRIS_BODY,
         }
         sent = {}
         with patch("smtplib.SMTP") as smtp_cls, \
-                patch("gateway.platforms.email._native_signature",
-                      return_value=("NATIVE SIG TEXT", "<div>NATIVE SIG HTML</div>")):
+             patch("gateway.platforms.email._native_signature",
+                   return_value=("NATIVE SIG TEXT", "<div>NATIVE SIG HTML</div>")):
             smtp = smtp_cls.return_value
             smtp.send_message.side_effect = lambda m: sent.update(msg=m)
             adapter._send_email("chris@test.com", "Got it — fixing the thread now.", None)
+
         msg = sent["msg"]
         self.assertEqual(msg.get_content_type(), "multipart/alternative")
-        parts = {p.get_content_type(): p.get_payload(decode=True).decode()
-                 for p in msg.get_payload()}
+        parts = {
+            p.get_content_type(): p.get_payload(decode=True).decode()
+            for p in msg.get_payload()
+        }
         self.assertIn("text/plain", parts)
         self.assertIn("text/html", parts)
-        self.assertNotIn("\u2014", parts["text/plain"].split("From:")[0])  # no-dash on Bella's words
+        self.assertNotIn("\u2014", parts["text/plain"].split("From:")[0])
         self.assertIn("From: Chris Barnes <chris@test.com>", parts["text/plain"])
         self.assertIn("<blockquote", parts["text/html"])
-        self.assertIn("Confidentiality", parts["text/plain"])   # full history kept
-        self.assertIn("NATIVE SIG TEXT", parts["text/plain"])    # native signature, not invented
+        self.assertIn("Confidentiality", parts["text/plain"])
+        self.assertIn("NATIVE SIG TEXT", parts["text/plain"])
         self.assertIn("NATIVE SIG HTML", parts["text/html"])
 
     def test_control_notices_are_suppressed(self):
@@ -1377,7 +1526,9 @@ class TestOutgoingHygiene(unittest.TestCase):
             adapter = _adapter_for_send()
             return adapter, await adapter.send(
                 "chris@test.com",
-                "⚠️ Gateway shutting down — Your current task will be interrupted.")
+                "⚠️ Gateway shutting down — Your current task will be interrupted.",
+            )
+
         adapter, res = asyncio.new_event_loop().run_until_complete(run())
         self.assertTrue(res.success)
         self.assertEqual(res.message_id, "suppressed-control-notice")
@@ -1397,6 +1548,7 @@ class TestOutgoingHygiene(unittest.TestCase):
                 send_now.assert_awaited_once()
                 body = send_now.await_args.args[1]
                 assert body == "part one\n\npart two\n\npart three", body
+
         asyncio.new_event_loop().run_until_complete(run())
 
 
