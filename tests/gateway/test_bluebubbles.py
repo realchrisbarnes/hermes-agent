@@ -180,6 +180,7 @@ class TestBlueBubblesMentionGating:
         adapter = _make_adapter(
             monkeypatch,
             require_mention=True,
+            dm_only=False,
             send_read_receipts=False,
         )
         handled = []
@@ -209,6 +210,7 @@ class TestBlueBubblesMentionGating:
         adapter = _make_adapter(
             monkeypatch,
             require_mention=True,
+            dm_only=False,
             send_read_receipts=False,
         )
         handled = []

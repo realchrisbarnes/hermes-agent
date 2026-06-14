@@ -248,14 +248,25 @@ def spawn_async_diagnostic(
     except OSError:
         return None
 
+    supervisor = (
+        "import subprocess, sys\n"
+        "script = sys.argv[1]\n"
+        "timeout = float(sys.argv[2])\n"
+        "try:\n"
+        "    subprocess.run(['bash', '-c', script], timeout=timeout, check=False)\n"
+        "except subprocess.TimeoutExpired:\n"
+        "    print('--- diagnostic timed out ---', flush=True)\n"
+    )
+
     try:
         # Detach from our process group so the subprocess survives even
         # if systemd kills our cgroup with KillMode=control-group (which
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
-        # before it can flush.
+        # before it can flush.  Use Python's own timeout support instead
+        # of GNU ``timeout`` so the probe also works on macOS.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            [sys.executable, "-c", supervisor, script, f"{timeout_seconds:.3f}"],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
