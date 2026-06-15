@@ -858,6 +858,28 @@ class TestPreflightCompression:
         assert compressed == compressed_messages
         assert prompt == "new prompt"
 
+    def test_todo_checkpoint_is_internal_not_synthetic_user_turn(self, agent):
+        """Todo preservation must not leak as a user-looking gateway message."""
+        agent._todo_store.write([
+            {"id": "active", "content": "finish the audit", "status": "in_progress"}
+        ])
+        compressed_messages = [{"role": "assistant", "content": "summary"}]
+
+        with (
+            patch.object(
+                agent.context_compressor, "compress", return_value=compressed_messages
+            ),
+            patch.object(agent, "_build_system_prompt", return_value="new prompt"),
+            patch("agent.conversation_compression.estimate_request_tokens_rough", return_value=42),
+        ):
+            compressed, _prompt = agent._compress_context(
+                [{"role": "user", "content": "old"}], "system prompt", force=True
+            )
+
+        assert compressed[-1]["role"] == "developer"
+        assert "finish the audit" in compressed[-1]["content"]
+        assert "Your active task list" not in compressed[-1]["content"]
+
 
 class TestToolResultPreflightCompression:
     """Compression should trigger when tool results push context past the threshold."""

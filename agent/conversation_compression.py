@@ -545,7 +545,13 @@ def compress_context(
 
     todo_snapshot = agent._todo_store.format_for_injection()
     if todo_snapshot:
-        compressed.append({"role": "user", "content": todo_snapshot})
+        # Keep the todo checkpoint available to the model after compression,
+        # but do not persist it as a synthetic user turn. Gateway platforms
+        # expose user-role messages as chat history/inbound-looking content,
+        # which can leak this internal checkpoint to the human instead of a
+        # real assistant reply. A developer message is internal instruction
+        # context and preserves the user/assistant transcript boundary.
+        compressed.append({"role": "developer", "content": todo_snapshot})
 
     agent._invalidate_system_prompt()
     new_system_prompt = agent._build_system_prompt(system_message)

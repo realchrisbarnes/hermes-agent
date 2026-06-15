@@ -61,6 +61,7 @@ class TestFormatForInjection:
             {"id": "3", "content": "Working", "status": "in_progress"},
         ])
         text = store.format_for_injection()
+        assert text is not None
         # Completed items are filtered out of injection
         assert "[x]" not in text
         assert "Do thing" not in text
@@ -70,6 +71,7 @@ class TestFormatForInjection:
         assert "Next" in text
         assert "Working" in text
         assert "context compression" in text.lower()
+        assert "Your active task list" not in text
 
 
 class TestMergeMode:
