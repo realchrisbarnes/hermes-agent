@@ -18,23 +18,73 @@ def test_version_string_no_v_prefix():
 
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     """When cache is fresh, check_for_updates should return cached value without calling git."""
-    from hermes_cli.banner import check_for_updates
+    import hermes_cli.banner as banner
     from hermes_cli import __version__
 
     # Create a fake git repo and fresh cache
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
     (repo_dir / ".git").mkdir()
+    fake_banner = repo_dir / "hermes_cli" / "banner.py"
+    fake_banner.parent.mkdir(parents=True, exist_ok=True)
+    fake_banner.touch()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}))
+    cache_file.write_text(json.dumps({
+        "ts": time.time(),
+        "behind": 3,
+        "ver": __version__,
+        "rev": None,
+        "git_head": "current-head",
+        "repo": str(repo_dir),
+    }))
 
+    monkeypatch.setattr(banner, "__file__", str(fake_banner))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
-        result = check_for_updates()
+    with patch("hermes_cli.banner._git_stdout", return_value="current-head") as mock_git, \
+         patch("hermes_cli.banner._check_via_local_git") as mock_local_check:
+        result = banner.check_for_updates()
 
     assert result == 3
-    mock_run.assert_not_called()
+    mock_git.assert_called_once_with(["rev-parse", "HEAD"], cwd=repo_dir)
+    mock_local_check.assert_not_called()
+
+
+def test_check_for_updates_invalidates_on_git_head_change(tmp_path, monkeypatch):
+    """Fresh source-install cache must be rejected after the checkout moves."""
+    import hermes_cli.banner as banner
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    fake_banner = repo_dir / "hermes_cli" / "banner.py"
+    fake_banner.parent.mkdir(parents=True, exist_ok=True)
+    fake_banner.touch()
+
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(json.dumps({
+        "ts": time.time(),
+        "behind": 10,
+        "ver": banner.VERSION,
+        "rev": None,
+        "git_head": "old-head",
+        "repo": str(repo_dir),
+    }))
+
+    monkeypatch.setattr(banner, "__file__", str(fake_banner))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_REVISION", raising=False)
+
+    with patch("hermes_cli.banner._git_stdout", return_value="new-head"), \
+         patch("hermes_cli.banner._check_via_local_git", return_value=0) as mock_local_check:
+        result = banner.check_for_updates()
+
+    assert result == 0
+    mock_local_check.assert_called_once_with(repo_dir)
+    written = json.loads(cache_file.read_text())
+    assert written["behind"] == 0
+    assert written["git_head"] == "new-head"
+    assert written["repo"] == str(repo_dir)
 
 
 def test_check_for_updates_invalidates_on_version_change(tmp_path, monkeypatch):
@@ -93,7 +143,7 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
         result = check_for_updates()
 
     assert result == 5
-    assert mock_run.call_count == 3  # origin probe + git fetch + git rev-list
+    assert mock_run.call_count == 4  # HEAD cache key + origin probe + git fetch + git rev-list
 
 
 def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):
