@@ -61,6 +61,28 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    async def _send_restart_acknowledgement(
+        self,
+        event: MessageEvent,
+        message: str,
+    ) -> bool:
+        """Send the /restart acknowledgement before shutdown begins."""
+        source = event.source
+        adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+        if adapter is None or not source.chat_id:
+            return False
+
+        try:
+            metadata = self._thread_metadata_for_source(
+                source,
+                self._reply_anchor_for_event(event),
+            )
+            result = await adapter.send(str(source.chat_id), message, metadata=metadata)
+            return result is None or bool(getattr(result, "success", False))
+        except Exception as exc:
+            logger.warning("Failed to send /restart acknowledgement: %s", exc)
+            return False
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
@@ -925,6 +947,13 @@ class GatewaySlashCommandsMixin:
             logger.debug("Failed to write restart dedup marker: %s", e)
 
         active_agents = self._running_agent_count()
+        acknowledgement = (
+            t("gateway.draining", count=active_agents)
+            if active_agents
+            else t("gateway.restart.restarting")
+        )
+        ack_sent = await self._send_restart_acknowledgement(event, acknowledgement)
+
         # When running under a service manager (systemd/launchd) or inside a
         # Docker/Podman container, use the service restart path: exit with
         # code 75 so the service manager / container restart policy restarts
@@ -938,8 +967,8 @@ class GatewaySlashCommandsMixin:
         else:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
-            return t("gateway.draining", count=active_agents)
-        return EphemeralReply(t("gateway.restart.restarting"))
+            return "" if ack_sent else acknowledgement
+        return "" if ack_sent else EphemeralReply(acknowledgement)
 
     async def _handle_version_command(self, event: MessageEvent) -> str:
         """Handle /version — show the running Hermes Agent version."""

@@ -19,7 +19,7 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     # Ensure INVOCATION_ID is NOT set — systemd sets this in service mode,
     # which changes the restart call signature.
     monkeypatch.delenv("INVOCATION_ID", raising=False)
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
     event = MessageEvent(
         text="/restart",
@@ -34,7 +34,8 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     result = await runner._handle_message(event)
 
     expected = t("gateway.draining", count=1)
-    assert result == expected
+    assert result == ""
+    assert any(expected in message for message in adapter.sent)
     # Guard against the silent-degradation regression in #22266: if the i18n
     # catalog cannot be resolved (e.g. xdist workers losing the locales path)
     # then ``t("gateway.draining", count=1)`` returns the bare key
