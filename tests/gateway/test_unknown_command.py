@@ -63,6 +63,7 @@ def _make_runner():
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner._running_agents = {}
+    runner._running_agents_ts = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = None
@@ -104,6 +105,32 @@ async def test_unknown_slash_command_returns_guidance(monkeypatch):
     assert "Unknown command" in result
     assert "/definitely-not-a-command" in result
     assert "/commands" in result
+    runner._run_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_near_miss_slash_command_suggests_known_command(monkeypatch):
+    """A close typo like /resart should be visible and suggest /restart,
+    not fall through to the LLM."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError(
+            "unknown slash command leaked through to the agent"
+        )
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("/resart"))
+
+    assert result is not None
+    assert "Unknown command" in result
+    assert "/resart" in result
+    assert "Did you mean `/restart`" in result
     runner._run_agent.assert_not_called()
 
 
@@ -168,6 +195,27 @@ async def test_underscored_alias_for_hyphenated_builtin_not_flagged(monkeypatch)
     # Whatever /reload_mcp returns, it must not be the unknown-command guard.
     if result is not None:
         assert "Unknown command" not in result
+
+
+@pytest.mark.asyncio
+async def test_near_miss_slash_command_returns_guidance_while_agent_running():
+    """When an agent is busy, /resart must not disappear into the active
+    session queue and must not execute /restart by typo."""
+    runner = _make_runner()
+    sk = build_session_key(_make_source())
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0
+    runner._handle_restart_command = AsyncMock(
+        side_effect=AssertionError("/resart must not execute /restart")
+    )
+
+    result = await runner._handle_message(_make_event("/resart"))
+
+    assert result is not None
+    assert "Unknown command" in result
+    assert "/resart" in result
+    assert "Did you mean `/restart`" in result
+    runner._handle_restart_command.assert_not_called()
 
 
 # ------------------------------------------------------------------

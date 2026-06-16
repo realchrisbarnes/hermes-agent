@@ -267,6 +267,23 @@ class TestCommandBypassActiveSession:
             "/queue response was not sent back to the user"
         )
 
+    @pytest.mark.asyncio
+    async def test_near_miss_command_bypasses_guard_for_guidance(self):
+        """A close typo like /resart must reach the runner so it can return
+        visible guidance instead of being queued as silent user text."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/resart"))
+
+        assert sk not in adapter._pending_messages, (
+            "/resart was queued as pending instead of reaching command guidance"
+        )
+        assert any("handled:resart" in r for r in adapter.sent_responses), (
+            "/resart produced no response — close command typos should be dispatched"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: non-bypass-set commands (no dedicated Level-2 handler) also bypass
@@ -341,6 +358,12 @@ class TestAllResolvableCommandsBypassGuard:
         assert should_bypass_active_session("") is False
         # A file path split on whitespace: '/path/to/file.py' -> 'path/to/file.py'
         assert should_bypass_active_session("path/to/file.py") is False
+
+    def test_should_bypass_returns_true_for_close_command_typo(self):
+        """Close command typos bypass so the runner can show a suggestion."""
+        from hermes_cli.commands import should_bypass_active_session
+
+        assert should_bypass_active_session("resart") is True
 
 
 # ---------------------------------------------------------------------------

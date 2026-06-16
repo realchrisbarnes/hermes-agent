@@ -18,6 +18,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from difflib import get_close_matches
 from typing import Any
 
 from utils import is_truthy_value
@@ -343,6 +344,35 @@ def is_gateway_known_command(name: str | None) -> bool:
     return False
 
 
+def suggest_gateway_command(name: str | None) -> str | None:
+    """Return a canonical gateway command suggestion for a close typo.
+
+    This is intentionally advisory only. Callers should use it to show
+    guidance, not to execute the suggested command implicitly.
+    """
+    if not name:
+        return None
+
+    normalized = name.lower().lstrip("/").replace("_", "-")
+    if not normalized or "/" in normalized:
+        return None
+    if resolve_command(normalized) is not None:
+        return None
+
+    candidates: dict[str, str] = {}
+    for cmd in COMMAND_REGISTRY:
+        if cmd.cli_only and not cmd.gateway_config_gate:
+            continue
+        candidates[cmd.name] = cmd.name
+        for alias in cmd.aliases:
+            candidates[alias.replace("_", "-")] = cmd.name
+
+    matches = get_close_matches(normalized, sorted(candidates), n=1, cutoff=0.82)
+    if not matches:
+        return None
+    return candidates[matches[0]]
+
+
 # Commands with explicit Level-2 running-agent handlers in gateway/run.py.
 # Listed here for introspection / tests; semantically a subset of
 # "all resolvable commands" — which is the real bypass set (see
@@ -369,7 +399,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
 
 
 def should_bypass_active_session(command_name: str | None) -> bool:
-    """Return True for any resolvable slash command.
+    """Return True for any resolvable slash command or close command typo.
 
     Rationale: every gateway-registered slash command either has a
     specific Level-2 handler in gateway/run.py (/stop, /new, /model,
@@ -387,8 +417,17 @@ def should_bypass_active_session(command_name: str | None) -> bool:
 
     ACTIVE_SESSION_BYPASS_COMMANDS remains the subset of commands with
     explicit Level-2 handlers; the rest fall through to the catch-all.
+
+    Close command typos also bypass so the gateway runner can return visible
+    "unknown command, did you mean..." guidance instead of queueing typo text
+    behind the active agent.
     """
-    return resolve_command(command_name) is not None if command_name else False
+    if not command_name:
+        return False
+    return (
+        resolve_command(command_name) is not None
+        or suggest_gateway_command(command_name) is not None
+    )
 
 
 def _resolve_config_gates() -> set[str]:

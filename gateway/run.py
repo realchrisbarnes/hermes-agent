@@ -2110,6 +2110,25 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
+def _unknown_gateway_command_message(command_name: str) -> str:
+    """Build the user-facing response for an unrecognized slash command."""
+    command = str(command_name or "").lstrip("/")
+    suggestion = None
+    try:
+        from hermes_cli.commands import suggest_gateway_command
+        suggestion = suggest_gateway_command(command)
+    except Exception:
+        suggestion = None
+
+    suggestion_text = f" Did you mean `/{suggestion}`?" if suggestion else ""
+    return (
+        f"Unknown command `/{command}`.{suggestion_text} "
+        f"Type /commands to see what's available, "
+        f"or resend without the leading slash to send "
+        f"as a regular message."
+    )
+
+
 def _parse_session_key(session_key: str) -> "dict | None":
     """Parse a session key into its component parts.
 
@@ -7481,10 +7500,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
                 ACTIVE_SESSION_BYPASS_COMMANDS as _DEDICATED_HANDLERS,
+                is_gateway_known_command as _is_gateway_known_command_inner,
                 resolve_command as _resolve_cmd_inner,
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+
+            if _evt_cmd and _cmd_def_inner is None:
+                _known_plugin_cmd = _is_gateway_known_command_inner(
+                    _evt_cmd.replace("_", "-")
+                )
+                if _known_plugin_cmd:
+                    return (
+                        f"⏳ Agent is running — `/{_evt_cmd}` can't run "
+                        f"mid-turn. Wait for the current response or `/stop` first."
+                    )
+                logger.warning(
+                    "Unrecognized slash command /%s from %s while agent is running — "
+                    "replying with unknown-command notice",
+                    _evt_cmd,
+                    source.platform.value if source.platform else "?",
+                )
+                return _unknown_gateway_command_message(_evt_cmd)
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -8296,12 +8333,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             command,
                             source.platform.value if source.platform else "?",
                         )
-                        return (
-                            f"Unknown command `/{command}`. "
-                            f"Type /commands to see what's available, "
-                            f"or resend without the leading slash to send "
-                            f"as a regular message."
-                        )
+                        return _unknown_gateway_command_message(command)
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         
