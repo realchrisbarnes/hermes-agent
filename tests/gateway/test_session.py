@@ -194,6 +194,43 @@ class TestBuildSessionContextPrompt:
         assert "Telegram" in prompt
         assert "Home Chat" in prompt
 
+    def test_telegram_prompt_guides_short_operator_status_prompts(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="111",
+            chat_name="Bella DM",
+            chat_type="dm",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "what's new" in prompt
+        assert "Bella/Hermes work status" in prompt
+        assert "Do not browse or search the web unless" in prompt
+        assert "operator-like" in prompt
+
+    @pytest.mark.parametrize("platform", [Platform.WHATSAPP, Platform.SIGNAL, Platform.BLUEBUBBLES])
+    def test_personal_messaging_prompts_share_operator_status_guidance(self, platform):
+        config = GatewayConfig(
+            platforms={platform: PlatformConfig(enabled=True, token="fake-token")},
+        )
+        source = SessionSource(
+            platform=platform,
+            chat_id="111",
+            chat_name="Bella DM",
+            chat_type="dm",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "Bella/Hermes work status" in prompt
+        assert "Do not browse or search the web unless" in prompt
+
     def test_bluebubbles_prompt_mentions_short_conversational_i_message_format(self):
         config = GatewayConfig(
             platforms={

@@ -26,7 +26,10 @@ try:
 
     DEFUSEDXML_AVAILABLE = True
 except ImportError:
-    ET = None  # type: ignore[assignment]
+    # Keep helper parsing paths usable in local/unit contexts.  Live callback
+    # startup still fails closed via check_wecom_callback_requirements().
+    from xml.etree import ElementTree as ET  # nosec B405
+
     DEFUSEDXML_AVAILABLE = False
 
 try:
