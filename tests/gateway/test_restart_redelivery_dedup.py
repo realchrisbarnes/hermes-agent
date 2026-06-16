@@ -32,13 +32,14 @@ async def test_restart_handler_writes_dedup_marker_with_update_id(tmp_path, monk
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
     event = _make_restart_event(update_id=12345)
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert result == ""
+    assert any("Restarting gateway" in message for message in adapter.sent)
     marker_path = tmp_path / ".restart_last_processed.json"
     assert marker_path.exists()
     data = json.loads(marker_path.read_text())
@@ -110,13 +111,14 @@ async def test_fresh_restart_with_higher_update_id_is_processed(tmp_path, monkey
         "requested_at": time.time() - 5,
     }))
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
     event = _make_restart_event(update_id=12346)  # strictly higher → fresh
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert result == ""
+    assert any("Restarting gateway" in message for message in adapter.sent)
     runner.request_restart.assert_called_once()
 
     # Marker is overwritten with the new update_id
@@ -137,14 +139,15 @@ async def test_stale_marker_older_than_5min_does_not_block(tmp_path, monkeypatch
         "requested_at": time.time() - 600,  # 10 minutes ago
     }))
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
     # Same update_id as the stale marker, but the marker is too old to trust
     event = _make_restart_event(update_id=12345)
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert result == ""
+    assert any("Restarting gateway" in message for message in adapter.sent)
     runner.request_restart.assert_called_once()
 
 
@@ -154,13 +157,14 @@ async def test_no_marker_file_allows_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
     event = _make_restart_event(update_id=100)
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert result == ""
+    assert any("Restarting gateway" in message for message in adapter.sent)
     runner.request_restart.assert_called_once()
 
 
@@ -173,13 +177,14 @@ async def test_corrupt_marker_file_is_treated_as_absent(tmp_path, monkeypatch):
     marker = tmp_path / ".restart_last_processed.json"
     marker.write_text("not-json{")
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
     event = _make_restart_event(update_id=100)
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert result == ""
+    assert any("Restarting gateway" in message for message in adapter.sent)
     runner.request_restart.assert_called_once()
 
 
@@ -196,14 +201,15 @@ async def test_event_without_update_id_bypasses_dedup(tmp_path, monkeypatch):
         "requested_at": time.time(),
     }))
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
     # No update_id — the dedup check should NOT kick in
     event = _make_restart_event(update_id=None)
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert result == ""
+    assert any("Restarting gateway" in message for message in adapter.sent)
     runner.request_restart.assert_called_once()
 
 
@@ -223,7 +229,7 @@ async def test_different_platform_bypasses_dedup(tmp_path, monkeypatch):
         "requested_at": time.time(),
     }))
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
     # /restart from Discord — not a redelivery candidate
@@ -243,4 +249,5 @@ async def test_different_platform_bypasses_dedup(tmp_path, monkeypatch):
     result = await runner._handle_restart_command(event)
 
     assert "Restarting gateway" in result
+    assert adapter.sent == []
     runner.request_restart.assert_called_once()

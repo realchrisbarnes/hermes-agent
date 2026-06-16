@@ -53,7 +53,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     """When /restart fires, the requester's routing info is persisted to disk."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
     source = make_restart_source(chat_id="42")
@@ -65,7 +65,8 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     )
 
     result = await runner._handle_restart_command(event)
-    assert "Restarting" in result
+    assert result == ""
+    assert any("Restarting" in message for message in adapter.sent)
 
     notify_path = tmp_path / ".restart_notify.json"
     assert notify_path.exists()
@@ -75,6 +76,44 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     assert data["chat_type"] == "dm"
     assert data["message_id"] == "m1"
     assert "thread_id" not in data  # no thread → omitted
+
+
+@pytest.mark.asyncio
+async def test_restart_command_sends_ack_before_requesting_restart(tmp_path, monkeypatch):
+    """The user-facing acknowledgement must be delivered before shutdown starts."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+
+    runner, adapter = make_restart_runner()
+    order = []
+
+    async def _send(chat_id, content, reply_to=None, metadata=None):
+        order.append(("send", content))
+        return SendResult(success=True, message_id="ack")
+
+    def _request_restart(**kwargs):
+        order.append(("request_restart", kwargs))
+        return True
+
+    adapter.send = AsyncMock(side_effect=_send)
+    runner.request_restart = MagicMock(side_effect=_request_restart)
+
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="42"),
+        message_id="m1",
+    )
+
+    result = await runner._handle_restart_command(event)
+
+    assert result == ""
+    assert order[0][0] == "send"
+    assert "Restarting" in order[0][1]
+    assert order[1] == (
+        "request_restart",
+        {"detached": True, "via_service": False},
+    )
 
 
 @pytest.mark.asyncio
