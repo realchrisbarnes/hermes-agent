@@ -212,6 +212,14 @@ that requires raw IDs).  Discord is excluded because mentions use ``<@user_id>``
 and the LLM needs the real ID to tag users."""
 
 
+_PERSONAL_MESSAGING_PLATFORMS = frozenset({
+    Platform.WHATSAPP,
+    Platform.SIGNAL,
+    Platform.TELEGRAM,
+    Platform.BLUEBUBBLES,
+})
+
+
 def _discord_tools_loaded() -> bool:
     """True iff the agent will actually have Discord tools this session.
 
@@ -398,6 +406,20 @@ def build_session_context_prompt(
             "use the yb_send_dm tool (look up the recipient by name or pass "
             "their user_id). Your normal reply is delivered to the group you "
             "are responding in."
+        )
+
+    if context.source.platform in _PERSONAL_MESSAGING_PLATFORMS:
+        lines.append("")
+        lines.append(
+            "**Messaging operator note:** Treat short or ambiguous operator "
+            "prompts (for example, 'what's new', 'status', 'you working?', "
+            "or 'any update?') as requests for Bella/Hermes work status in "
+            "this local session, not as external news or research. Do not "
+            "browse or search the web unless the user explicitly asks for "
+            "news, research, online sources, or latest information outside "
+            "the local session. Keep replies concise, operator-like, and "
+            "grounded in visible local work; if the target is unclear, ask "
+            "one brief clarifying question before using tools."
         )
 
     # Connected platforms
