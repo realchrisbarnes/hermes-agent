@@ -621,6 +621,24 @@ class StreamingRefineAgent:
         }
 
 
+class FailedStreamingFragmentAgent:
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.stream_delta_callback:
+            self.stream_delta_callback("{")
+        return {
+            "final_response": "I could not produce a usable reply.",
+            "failed": True,
+            "partial": True,
+            "error": "Response remained truncated after 3 continuation attempts",
+            "messages": [],
+            "api_calls": 3,
+        }
+
+
 class QueuedCommentaryAgent:
     calls = 0
 
@@ -846,6 +864,28 @@ async def test_run_agent_streaming_does_not_enable_completed_interim_commentary(
 
 
 @pytest.mark.asyncio
+async def test_run_agent_streaming_master_gate_overrides_platform_true(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-streaming-master-off",
+        config_data={
+            "display": {
+                "tool_progress": "off",
+                "interim_assistant_messages": False,
+                "platforms": {"telegram": {"streaming": True}},
+            },
+            "streaming": {"enabled": False, "transport": "auto"},
+        },
+    )
+
+    assert result.get("already_sent") is not True
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
 async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -941,6 +981,25 @@ async def test_run_agent_matrix_streaming_omits_cursor(monkeypatch, tmp_path):
     assert all_text, "expected streamed Matrix content to be sent or edited"
     assert all("▉" not in text for text in all_text)
     assert any("Continuing to refine:" in text for text in all_text)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_failed_streamed_fragment_still_requires_final_send(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FailedStreamingFragmentAgent,
+        session_id="sess-failed-streamed-fragment",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+    )
+
+    assert result.get("failed") is True
+    assert result.get("already_sent") is not True
+    assert result["final_response"] == "I could not produce a usable reply."
+    assert any(call["content"] == "{" for call in adapter.sent + adapter.edits)
 
 
 class TransformedStreamAgent:
