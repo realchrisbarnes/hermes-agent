@@ -397,6 +397,20 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
         )
 
 
+def _is_unusable_truncated_response(text: Optional[str]) -> bool:
+    """Return True when exhausted continuation output is too small to trust."""
+    if not text or not text.strip():
+        return True
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= 12:
+        return True
+    if len(compact) <= 40:
+        words = re.findall(r"[A-Za-z0-9]+", compact)
+        if len(words) <= 2 and not re.search(r"[.!?)]$", compact):
+            return True
+    return False
+
+
 # Shared recovery hint appended to every content-policy refusal message. Both
 # the HTTP-200 refusal path (``finish_reason=content_filter``) and the
 # exception path (a provider moderation error classified as
@@ -1631,6 +1645,29 @@ def run_conversation(
                                 break
 
                             partial_response = agent._strip_think_blocks("".join(truncated_response_parts)).strip()
+                            if _is_unusable_truncated_response(partial_response):
+                                unusable_error = (
+                                    "Response remained truncated after 3 continuation attempts; "
+                                    "only an unusable fragment was produced"
+                                )
+                                unusable_response = (
+                                    "I could not produce a usable reply. The model hit "
+                                    "the output limit repeatedly and returned only a tiny, "
+                                    "code-like fragment.\n\n"
+                                    "Start a fresh Telegram session with `/new`, or rephrase "
+                                    "the request so Bella can answer cleanly."
+                                )
+                                agent._cleanup_task_resources(effective_task_id)
+                                agent._persist_session(messages, conversation_history)
+                                return {
+                                    "final_response": unusable_response,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "failed": True,
+                                    "error": unusable_error,
+                                }
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {

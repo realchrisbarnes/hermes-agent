@@ -4187,6 +4187,28 @@ class TestRunConversation:
         assert second_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in second_call_messages[-1]["content"]
 
+    def test_tiny_structural_length_fragments_return_actionable_error(self, agent):
+        """Do not surface continuation junk like ``{`` / fences as final chat text."""
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="{", finish_reason="length"),
+            _mock_response(content="I", finish_reason="length"),
+            _mock_response(content="```", finish_reason="length"),
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Whats new?")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "truncated" in result["error"].lower()
+        assert "could not produce a usable reply" in result["final_response"].lower()
+        assert "{I```" not in result["final_response"]
+
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
         self._setup_agent(agent)
