@@ -291,6 +291,29 @@ _SENSITIVE_PATH_PREFIXES = (
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
+
+def _temp_path_prefixes() -> tuple[str, ...]:
+    """OS per-user temp roots that are legitimate write targets.
+
+    On macOS the per-user temp dir is ``/var/folders/xx/.../T/`` which
+    ``realpath`` resolves to ``/private/var/folders/...`` — i.e. it lives
+    under the ``/private/var/`` sensitive prefix. Per-user temp (pytest
+    tmp_path, scratch files) must remain writable, so allow these roots
+    explicitly before the sensitive-prefix check below.
+    """
+    prefixes = {"/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"}
+    try:
+        import tempfile
+        td = tempfile.gettempdir()
+        prefixes.add(td.rstrip("/") + "/")
+        prefixes.add(os.path.realpath(td).rstrip("/") + "/")
+    except Exception:
+        pass
+    return tuple(prefixes)
+
+
+_TEMP_PATH_PREFIXES = _temp_path_prefixes()
+
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
 
@@ -323,6 +346,12 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    # OS per-user temp is always a legitimate write target. On macOS it lives
+    # under /private/var/folders/... (inside the /private/var/ sensitive
+    # prefix), so this allow-check must run BEFORE the sensitive-prefix loop.
+    for tprefix in _TEMP_PATH_PREFIXES:
+        if resolved.startswith(tprefix) or normalized.startswith(tprefix):
+            return None
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
             return _err
