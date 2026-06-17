@@ -4468,17 +4468,33 @@ class BasePlatformAdapter(ABC):
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
+                # BUT only a *substantive* response represents a lost answer.
+                # A trivially short response (e.g. a 2-char whitespace/markdown
+                # artifact that extracts to empty) loses no real content, so it
+                # is logged at DEBUG — escalating it to ERROR floods the logs
+                # (a single stuck session emitted ~850 such 2-char drops) and
+                # buries genuine drops. Substantive drops still ERROR loudly.
+                _SUBSTANTIVE_DROP_MIN = 10  # chars of real content worth flagging
                 _anything_delivered = (
                     delivery_attempted or _tts_caption_delivered
                     or images or local_files or media_files
                 )
-                if not _anything_delivered and _response_pre_extract.strip():
-                    logger.error(
-                        "[%s] response_delivery_dropped: non-empty response "
-                        "(%d chars) produced no delivered message or attachment "
-                        "for %s (empty after extract, recovery yielded nothing).",
-                        self.name, len(_response_pre_extract), event.source.chat_id,
-                    )
+                _dropped_len = len(_response_pre_extract.strip())
+                if not _anything_delivered and _dropped_len:
+                    if _dropped_len >= _SUBSTANTIVE_DROP_MIN:
+                        logger.error(
+                            "[%s] response_delivery_dropped: non-empty response "
+                            "(%d chars) produced no delivered message or attachment "
+                            "for %s (empty after extract, recovery yielded nothing).",
+                            self.name, len(_response_pre_extract), event.source.chat_id,
+                        )
+                    else:
+                        logger.debug(
+                            "[%s] response_delivery_dropped: trivial response "
+                            "(%d chars) extracted to nothing for %s; no real "
+                            "content lost.",
+                            self.name, len(_response_pre_extract), event.source.chat_id,
+                        )
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
