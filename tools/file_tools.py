@@ -384,6 +384,19 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    # Prevent agents from modifying the Hermes config file directly.
+    # approvals.mode and other security settings live here; a malicious or
+    # prompt-injected agent could silently disable exec approval by writing to
+    # this file. This must run BEFORE the temp-path allowance below: the config
+    # is security-sensitive regardless of where it resolves (and a test/sandbox
+    # can place it under a temp root), so the temp allow-list must not bypass it.
+    hermes_config = _get_hermes_config_resolved()
+    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
+        return (
+            f"Refusing to write to Hermes config file: {filepath}\n"
+            "Agent cannot modify security-sensitive configuration. "
+            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+        )
     # OS per-user temp is always a legitimate write target. On macOS it lives
     # under /private/var/folders/... (inside the /private/var/ sensitive
     # prefix), so this allow-check must run BEFORE the sensitive-prefix loop.
@@ -395,17 +408,6 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
-    # Prevent agents from modifying the Hermes config file directly.
-    # approvals.mode and other security settings live here; a malicious or
-    # prompt-injected agent could silently disable exec approval by writing to
-    # this file.
-    hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
-        )
     return None
 
 

@@ -817,7 +817,7 @@ class TestPreflightCompression:
             big_history.append({"role": "assistant", "content": f"Response {i} padded text"})
 
         with (
-            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=144_669),
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=144_669),
             patch.object(agent, "_persist_session") as mock_persist,
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),

@@ -548,6 +548,26 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Preflight compression hit the auto-compression hard limit and refused.
+    # Return the clean failure now, before any provider call, so a session that
+    # can no longer be compressed stops instead of spiralling.
+    _preflight_abort = getattr(_ctx, "preflight_abort_result", None)
+    if _preflight_abort is not None:
+        agent._flush_status_buffer()
+        _abort_err = _preflight_abort.get(
+            "error", "Automatic context compression limit reached."
+        )
+        agent._vprint(f"{agent.log_prefix}❌ {_abort_err}", force=True)
+        agent._vprint(
+            f"{agent.log_prefix}   💡 Start /new, reset this chat, or run "
+            "/compress manually with a focus topic before retrying.",
+            force=True,
+        )
+        # build_turn_context already persisted the session this turn (early
+        # crash-resilience persistence) and the abort left messages unchanged,
+        # so no second _persist_session call is needed here.
+        return _preflight_abort
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None

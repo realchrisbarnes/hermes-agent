@@ -59,6 +59,11 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Set when preflight compression hit the auto-compression hard limit and
+    # refused (returns messages unchanged). The turn loop returns this result
+    # dict instead of proceeding into a doomed provider call. See
+    # ContextCompressor.auto_compression_limit_reached().
+    preflight_abort_result: Optional[Dict[str, Any]] = None
 
 
 def build_turn_context(
@@ -266,6 +271,7 @@ def build_turn_context(
         )
 
     # ── Preflight context compression ──
+    _preflight_abort_result: Optional[Dict[str, Any]] = None
     if (
         agent.compression_enabled
         and len(messages) > agent.context_compressor.protect_first_n
@@ -318,6 +324,27 @@ def build_turn_context(
                     task_id=effective_task_id,
                 )
                 if len(messages) >= _orig_len:
+                    # Compression made no progress. If it refused because the
+                    # auto-compression hard limit was reached, surface a clean
+                    # failure so the turn loop returns BEFORE the provider call
+                    # instead of spending an API request on a context we already
+                    # know is too large to shrink further.
+                    if getattr(_compressor, "_last_compress_aborted", False):
+                        _abort_err = getattr(
+                            _compressor,
+                            "_last_summary_error",
+                            "Automatic context compression limit reached.",
+                        )
+                        _preflight_abort_result = {
+                            "messages": messages,
+                            "final_response": _abort_err,
+                            "completed": False,
+                            "api_calls": 0,
+                            "error": _abort_err,
+                            "partial": True,
+                            "failed": True,
+                            "auto_compression_limit_reached": True,
+                        }
                     break  # Cannot compress further
                 conversation_history = None
                 agent._empty_content_retries = 0
@@ -405,4 +432,5 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        preflight_abort_result=_preflight_abort_result,
     )

@@ -1020,7 +1020,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.starttls(context=ssl.create_default_context())
+            # _connect_smtp() already established STARTTLS; just authenticate.
             self._smtp_login(smtp)
             smtp.send_message(msg)
         finally:
@@ -1149,7 +1149,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.starttls(context=ssl.create_default_context())
+            # _connect_smtp() already established STARTTLS; just authenticate.
             self._smtp_login(smtp)
             smtp.send_message(msg)
         finally:
@@ -1230,7 +1230,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.starttls(context=ssl.create_default_context())
+            # _connect_smtp() already established STARTTLS; just authenticate.
             self._smtp_login(smtp)
             smtp.send_message(msg)
         finally:
