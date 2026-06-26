@@ -120,8 +120,17 @@ class _IPv4SMTP_SSL(smtplib.SMTP_SSL):
             server_hostname=getattr(self, "_host", host),
         )
 
+
+class _IPv4IMAP4_SSL(imaplib.IMAP4_SSL):
+    """IMAP SSL client constrained to IPv4 for networks without IPv6 routing."""
+
+    def _create_socket(self, timeout):  # type: ignore[override]
+        raw_sock = _create_ipv4_connection(self.host, self.port, timeout)
+        return self.ssl_context.wrap_socket(raw_sock, server_hostname=self.host)
+
 # Supported image extensions for inline detection
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
 
 def _send_imap_id(imap: "imaplib.IMAP4") -> None:
     """Send RFC 2971 IMAP ID command identifying this client.
@@ -615,6 +624,21 @@ class EmailAdapter(BasePlatformAdapter):
             # Fallback: just clear old entries if sort fails
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
 
+    def _connect_imap(self) -> imaplib.IMAP4_SSL:
+        """Create an IMAP SSL connection with IPv4 fallback.
+
+        Some networks publish IPv6 DNS records while IPv6 routing is unavailable.
+        The stdlib IMAP client can fail before reaching IPv4; retrying through an
+        IPv4-only client keeps email polling alive without global resolver hacks.
+        """
+        try:
+            return imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+        except (ConnectionError, OSError) as exc:
+            if isinstance(exc, (ssl.SSLError, socket.timeout, TimeoutError)):
+                raise
+            logger.info("[Email] IMAP primary connect failed; retrying IPv4: %s", exc)
+            return _IPv4IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create an SMTP connection, selecting the correct protocol for the port.
 
@@ -661,7 +685,7 @@ class EmailAdapter(BasePlatformAdapter):
         """Connect to the IMAP server and start polling for new messages."""
         try:
             # Test IMAP connection
-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            imap = self._connect_imap()
             self._imap_login(imap)
             _send_imap_id(imap)
             # Mark all existing messages as seen so we only process new ones
@@ -680,8 +704,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         try:
             # Test SMTP connection
-            smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
-            smtp.starttls(context=ssl.create_default_context())
+            smtp = self._connect_smtp()
             self._smtp_login(smtp)
             smtp.quit()
             logger.info("[Email] SMTP connection test passed.")
@@ -734,7 +757,7 @@ class EmailAdapter(BasePlatformAdapter):
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
         results = []
         try:
-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            imap = self._connect_imap()
             try:
                 self._imap_login(imap)
                 _send_imap_id(imap)

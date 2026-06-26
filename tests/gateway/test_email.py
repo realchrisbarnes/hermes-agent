@@ -1578,5 +1578,45 @@ class TestOutgoingHygiene(unittest.TestCase):
         asyncio.new_event_loop().run_until_complete(run())
 
 
+class TestEmailConnectionFallback(unittest.TestCase):
+    """Connection helpers retry IPv4 when IPv6/default paths fail."""
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_AUTH_METHOD": "password",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            from gateway.platforms.email import EmailAdapter
+            return EmailAdapter(PlatformConfig(enabled=True))
+
+    def test_imap_connect_retries_ipv4_on_os_error(self):
+        adapter = self._make_adapter()
+        with patch("imaplib.IMAP4_SSL", side_effect=OSError("network unreachable")) as primary, \
+                patch("gateway.platforms.email._IPv4IMAP4_SSL") as ipv4:
+            self.assertIs(adapter._connect_imap(), ipv4.return_value)
+            primary.assert_called_once()
+            ipv4.assert_called_once_with("imap.test.com", 993, timeout=30)
+
+    def test_connect_uses_smtp_helper_for_ipv4_fallback(self):
+        import asyncio
+        adapter = self._make_adapter()
+        imap = MagicMock()
+        imap.uid.return_value = ("OK", [b""])
+        smtp = MagicMock()
+        with patch.object(adapter, "_connect_imap", return_value=imap), \
+                patch.object(adapter, "_imap_login"), \
+                patch("gateway.platforms.email._send_imap_id"), \
+                patch.object(adapter, "_connect_smtp", return_value=smtp) as connect_smtp, \
+                patch.object(adapter, "_smtp_login"):
+            async def run():
+                self.assertTrue(await adapter.connect())
+                connect_smtp.assert_called_once()
+                await adapter.disconnect()
+            asyncio.run(run())
+
 if __name__ == "__main__":
     unittest.main()
