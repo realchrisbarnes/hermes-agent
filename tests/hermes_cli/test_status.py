@@ -157,6 +157,29 @@ def _base_xai_mocks(monkeypatch, tmp_path):
     return status_mod
 
 
+def test_show_status_all_redacts_api_keys(monkeypatch, capsys, tmp_path):
+    import hermes_cli.auth as auth_mod
+
+    status_mod = _base_xai_mocks(monkeypatch, tmp_path)
+    openai_key = "sk-test-status-openai-1234567890abcdef"
+    anthropic_key = "sk-ant-oat01-status-1234567890abcdef"
+    env_values = {
+        "OPENAI_API_KEY": openai_key,
+        "ANTHROPIC_TOKEN": anthropic_key,
+    }
+
+    monkeypatch.setattr(status_mod, "get_env_value", lambda name: env_values.get(name, ""), raising=False)
+    monkeypatch.setattr(auth_mod, "get_anthropic_key", lambda: anthropic_key, raising=False)
+
+    status_mod.show_status(SimpleNamespace(all=True, deep=False))
+
+    out = capsys.readouterr().out
+    assert "OpenAI" in out
+    assert "Anthropic" in out
+    assert openai_key not in out
+    assert anthropic_key not in out
+
+
 class TestShowStatusXaiOAuth:
     """xAI OAuth row in hermes status."""
 

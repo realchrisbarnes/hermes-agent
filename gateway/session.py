@@ -422,6 +422,20 @@ def build_session_context_prompt(
             "one brief clarifying question before using tools."
         )
 
+    if context.source.platform in _PERSONAL_MESSAGING_PLATFORMS:
+        lines.append("")
+        lines.append(
+            "**Messaging operator note:** Treat short or ambiguous operator "
+            "prompts (for example, 'what's new', 'status', 'you working?', "
+            "or 'any update?') as requests for Bella/Hermes work status in "
+            "this local session, not as external news or research. Do not "
+            "browse or search the web unless the user explicitly asks for "
+            "news, research, online sources, or latest information outside "
+            "the local session. Keep replies concise, operator-like, and "
+            "grounded in visible local work; if the target is unclear, ask "
+            "one brief clarifying question before using tools."
+        )
+
     # Connected platforms
     platforms_list = ["local (files on this machine)"]
     for p in context.connected_platforms:

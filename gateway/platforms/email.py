@@ -705,8 +705,10 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             # Test SMTP connection
             smtp = self._connect_smtp()
-            self._smtp_login(smtp)
-            smtp.quit()
+            try:
+                self._smtp_login(smtp)
+            finally:
+                smtp.quit()
             logger.info("[Email] SMTP connection test passed.")
         except Exception as e:
             logger.error("[Email] SMTP connection failed: %s", e)

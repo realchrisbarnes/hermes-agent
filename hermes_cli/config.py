@@ -4326,6 +4326,12 @@ def check_config_version() -> Tuple[int, int]:
     if not isinstance(config, dict):
         config = {}
     current = _coerce_config_version(config.get("_config_version"))
+    if "_config_version" not in config:
+        # Legacy installs used ``config_version`` before the private
+        # ``_config_version`` key became canonical. Read it only as an alias
+        # when the canonical key is absent so older files still run every
+        # missed migration step instead of inheriting the latest defaults.
+        current = _coerce_config_version(config.get("config_version"))
     return current, latest
 
 
@@ -4598,6 +4604,12 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
 
     # Check config version
     current_ver, latest_ver = check_config_version()
+    if current_ver < latest_ver:
+        config = read_raw_config()
+        if "_config_version" not in config and "config_version" in config:
+            config["_config_version"] = current_ver
+            config.pop("config_version", None)
+            save_config(config)
     
     # ── Version 3 → 4: migrate tool progress from .env to config.yaml ──
     if current_ver < 4:

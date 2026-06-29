@@ -669,6 +669,44 @@ class TestConfigVersionDetection:
             latest = DEFAULT_CONFIG["_config_version"]
             assert check_config_version() == (latest, latest)
 
+    def test_check_config_version_uses_legacy_alias_when_private_version_absent(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump({"config_version": 13}), encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            assert check_config_version() == (13, DEFAULT_CONFIG["_config_version"])
+
+    def test_legacy_config_version_alias_migrates_summary_compression(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "config_version": 13,
+                    "compression": {
+                        "enabled": True,
+                        "summary_model": "MiniMax-M2.7",
+                        "summary_provider": "minimax-cn",
+                        "summary_base_url": "https://example.test/v1",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert "config_version" not in raw
+        assert raw["auxiliary"]["compression"]["model"] == "MiniMax-M2.7"
+        assert raw["auxiliary"]["compression"]["provider"] == "minimax-cn"
+        assert raw["auxiliary"]["compression"]["base_url"] == "https://example.test/v1"
+        assert raw["compression"]["enabled"] is True
+        assert "summary_model" not in raw["compression"]
+        assert "summary_provider" not in raw["compression"]
+        assert "summary_base_url" not in raw["compression"]
+
 
 class TestAnthropicTokenMigration:
     """Test that config version 8→9 clears ANTHROPIC_TOKEN."""

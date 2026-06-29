@@ -536,6 +536,8 @@ def run_conversation(
         set_current_write_origin=set_current_write_origin,
         ra=_ra,
     )
+    if _ctx.early_result is not None:
+        return _ctx.early_result
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages

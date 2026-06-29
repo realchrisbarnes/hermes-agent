@@ -59,6 +59,8 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Optional structured result when the prologue must stop before the LLM loop.
+    early_result: Optional[Dict[str, Any]] = None
     # Set when preflight compression hit the auto-compression hard limit and
     # refused (returns messages unchanged). The turn loop returns this result
     # dict instead of proceeding into a doomed provider call. See

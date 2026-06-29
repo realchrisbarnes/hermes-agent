@@ -78,6 +78,8 @@ from plugins.web.exa.provider import _get_exa_client  # noqa: F401
 # these via tools.web_tools so unit tests that reset
 # ``tools.web_tools._<vendor>_client = None`` between cases keep working.
 _firecrawl_client: Optional[Any] = None
+
+_SEARCH_ONLY_BACKENDS = {"brave-free", "ddgs", "searxng", "xai"}
 _firecrawl_client_config: Optional[Any] = None
 _parallel_client: Optional[Any] = None
 _async_parallel_client: Optional[Any] = None
@@ -1208,15 +1210,15 @@ def check_web_search_available() -> bool:
 
 
 def check_web_extract_available() -> bool:
-    """Check whether native URL extraction is available.
+    """Return True when the selected web_extract backend can service URL fetches.
 
-    Search-only backends such as ddgs, SearXNG, and Brave free search make
-    web_search usable, but they must not advertise native web_extract.
+    Search-only backends such as ddgs, SearXNG, X Search, and Brave free search
+    make web_search usable, but they must not advertise native web_extract.
     """
-    configured = _configured_web_backend("extract")
-    if configured:
-        return configured in EXTRACT_CAPABLE_BACKENDS and _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in EXTRACT_CAPABLE_BACKENDS)
+    backend = _get_extract_backend()
+    if backend in _SEARCH_ONLY_BACKENDS:
+        return False
+    return _is_backend_available(backend)
 
 
 def check_web_api_key() -> bool:

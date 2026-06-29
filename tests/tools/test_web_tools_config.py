@@ -646,7 +646,47 @@ class TestCheckWebApiKey:
 
     def test_no_keys_returns_true_for_free_ddgs_search(self):
         from tools.web_tools import check_web_api_key
-        with patch("tools.web_tools._ddgs_package_importable", return_value=False):
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._is_tool_gateway_ready", return_value=False), \
+             patch("tools.web_tools._ddgs_package_importable", return_value=False), \
+             patch.dict(os.environ, {}, clear=False):
+            for k in ("PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL",
+                      "TAVILY_API_KEY", "EXA_API_KEY", "SEARXNG_URL", "BRAVE_SEARCH_API_KEY"):
+                os.environ.pop(k, None)
+            assert check_web_api_key() is False
+
+    def test_typo_extract_backend_falls_back_but_reports_unusable_without_creds(self):
+        """A typo'd per-capability backend should not make web look configured."""
+        from tools.web_tools import _get_extract_backend, check_web_api_key
+        with patch("tools.web_tools._load_web_config", return_value={"extract_backend": "parrallel"}), \
+             patch("tools.web_tools._is_tool_gateway_ready", return_value=False), \
+             patch("tools.web_tools._ddgs_package_importable", return_value=False), \
+             patch.dict(os.environ, {}, clear=False):
+            for key in self._ENV_KEYS:
+                os.environ.pop(key, None)
+            assert _get_extract_backend() == "firecrawl"
+            assert check_web_api_key() is False
+
+    def test_search_and_extract_truth_helpers_are_separate(self):
+        from tools.web_tools import check_web_extract_available, check_web_search_available
+
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "ddgs"}), \
+             patch("tools.web_tools._ddgs_package_importable", return_value=True):
+            assert check_web_search_available() is True
+            assert check_web_extract_available() is False
+
+        with patch("tools.web_tools._load_web_config", return_value={"extract_backend": "firecrawl"}), \
+             patch.dict(os.environ, {"FIRECRAWL_API_KEY": "fc-test"}):
+            assert check_web_extract_available() is True
+
+    def test_configured_but_unavailable_backend_reports_unusable(self):
+        """An explicitly configured backend with no creds (exa, no key) →
+        check_web_api_key False so diagnostics flag the misconfiguration —
+        even though the tools stay registered."""
+        from tools.web_tools import check_web_api_key
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "exa"}), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EXA_API_KEY", None)
             assert check_web_api_key() is False
         with patch("tools.web_tools._ddgs_package_importable", return_value=True):
             assert check_web_api_key() is True

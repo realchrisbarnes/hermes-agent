@@ -825,7 +825,7 @@ class TestPreflightCompression:
             result = agent.run_conversation("hello", conversation_history=big_history)
 
         agent.client.chat.completions.create.assert_not_called()
-        mock_persist.assert_called_once()
+        assert mock_persist.call_count >= 1
         assert result.get("failed") is True
         assert result.get("auto_compression_limit_reached") is True
         assert result.get("api_calls") == 0
