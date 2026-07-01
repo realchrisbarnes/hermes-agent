@@ -70,6 +70,28 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+# Consecutive identical outer-loop exceptions tolerated before the turn aborts.
+# Deterministic errors (a poisoned message object, a code bug) reproduce
+# byte-identically on every retry and never heal; without this cap the loop
+# retries to max_iterations (observed 2026-07-01: 89 identical TypeErrors in
+# under a second). 3 keeps tolerance for coincidentally-identical transient
+# provider errors while stopping deterministic ones almost immediately.
+OUTER_ERROR_CIRCUIT_LIMIT = 3
+
+
+def _outer_error_circuit(sig: str, last_sig: Optional[str], count: int) -> tuple[str, int, bool]:
+    """Track consecutive identical outer-loop error signatures.
+
+    Returns (new_last_sig, new_count, should_break). A signature change resets
+    the count; ``should_break`` is True once ``count`` reaches
+    OUTER_ERROR_CIRCUIT_LIMIT for the same signature.
+    """
+    if sig == last_sig:
+        count += 1
+    else:
+        count = 1
+    return sig, count, count >= OUTER_ERROR_CIRCUIT_LIMIT
+
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
@@ -581,6 +603,8 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    _outer_error_last_sig: Optional[str] = None
+    _outer_error_count = 0
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -4510,6 +4534,28 @@ def run_conversation(
             # the retry loop continues.  Injecting a fake user/assistant
             # message pollutes history, burns tokens, and risks violating
             # role-alternation invariants.
+
+            # Circuit breaker: the same exception repeating verbatim is
+            # deterministic (poisoned message object, code bug) and will not
+            # heal by retrying. Abort the turn honestly instead of burning
+            # the whole iteration budget (and provider spend) on it.
+            _outer_error_last_sig, _outer_error_count, _should_break = _outer_error_circuit(
+                f"{type(e).__name__}: {e}", _outer_error_last_sig, _outer_error_count
+            )
+            if _should_break:
+                _turn_exit_reason = (
+                    f"error_circuit_breaker({_outer_error_count}x {str(e)[:80]})"
+                )
+                final_response = (
+                    f"I hit the same internal error {_outer_error_count} times in a row "
+                    f"and stopped retrying: {error_msg}"
+                )
+                messages.append({"role": "assistant", "content": final_response})
+                logger.error(
+                    "Outer-loop circuit breaker tripped after %d identical errors: %s",
+                    _outer_error_count, error_msg,
+                )
+                break
 
             # If we're near the limit, break to avoid infinite loops
             if api_call_count >= agent.max_iterations - 1:

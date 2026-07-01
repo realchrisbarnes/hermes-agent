@@ -273,6 +273,19 @@ def setup_logging(
     """
     global _logging_initialized
     home = hermes_home or get_hermes_home()
+
+    # Test-run fence (2026-07-01): a pytest session must never write the LIVE
+    # ops logs. ~/.hermes/logs feeds the HQ operations log digest; a mocked
+    # in-process agent test once wrote 89 identical TypeErrors into the real
+    # errors.log and flipped the ops dashboard to DEGRADED. conftest isolates
+    # HERMES_HOME per test, but import-time init, direct script invocation,
+    # and subprocesses can still resolve the real home - so divert at the
+    # sink. Explicit non-live homes (per-test tempdirs) pass through.
+    if os.environ.get("PYTEST_CURRENT_TEST") and home == Path.home() / ".hermes":
+        import tempfile
+
+        home = Path(tempfile.gettempdir()) / "hermes-pytest-logs"
+
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
