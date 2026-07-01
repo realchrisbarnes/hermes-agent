@@ -302,6 +302,30 @@ class TestMemoryStoreAdd:
         assert "usage" in result
         assert "retry" in result["error"].lower()
 
+    def test_add_overflow_is_archived_not_lost(self, store, tmp_path):
+        # A rejected over-limit add must be captured to a durable dead-letter so
+        # the fact is never silently lost (Chris: Bella cannot lose memory).
+        store.add("memory", "x" * 490)
+        result = store.add("memory", "IMPORTANT new fact that overflows the cap")
+        assert result["success"] is False
+        assert result.get("overflow_archive")
+        overflow = tmp_path / "MEMORY.md.overflow.md"
+        assert overflow.exists()
+        assert "IMPORTANT new fact that overflows the cap" in overflow.read_text()
+
+    def test_batch_overflow_is_archived_not_lost(self, store, tmp_path):
+        store.add("memory", "x" * 470)
+        result = store.apply_batch("memory", [
+            {"action": "add", "content": "batch fact one that will not fit"},
+            {"action": "add", "content": "batch fact two that will not fit either"},
+        ])
+        assert result["success"] is False
+        overflow = tmp_path / "MEMORY.md.overflow.md"
+        assert overflow.exists()
+        body = overflow.read_text()
+        assert "batch fact one that will not fit" in body
+        assert "batch fact two that will not fit either" in body
+
     def test_replace_exceeding_limit_returns_consolidation_context(self, store):
         # A replace that blows the budget should mirror the add-overflow shape:
         # echo current_entries + usage and tell the model to retry in-turn.

@@ -294,6 +294,33 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    def _archive_overflow(self, target: str, contents: List[str]) -> Optional[str]:
+        """Durably capture memory content that does not fit the always-in-context
+        cap, so an over-limit write is never silently lost.
+
+        The overflow response asks the model to curate and retry, but it does not
+        always do so in the same turn -- without this, the new fact just vanishes.
+        We append it to a dead-letter file next to the memory file. That file is
+        NOT injected into the system prompt (only MEMORY.md/USER.md are), so it
+        adds no prompt-injection surface; a later consolidation pass can fold
+        entries back into active memory. Best-effort: a failed archive never
+        turns a rejection into an exception.
+        """
+        kept = [c.strip() for c in contents if c and c.strip()]
+        if not kept:
+            return None
+        try:
+            base = self._path_for(target)
+            overflow = base.with_name(base.name + ".overflow.md")
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            block = "".join(f"\n<!-- overflow {stamp} -->\n{c}\n" for c in kept)
+            with open(overflow, "a", encoding="utf-8") as fh:
+                fh.write(block)
+            return str(overflow)
+        except Exception:
+            logger.warning("memory overflow archive failed for target=%s", target, exc_info=True)
+            return None
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -327,17 +354,20 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
+                archived = self._archive_overflow(target, [content])
                 return {
                     "success": False,
                     "error": (
                         f"Memory at {current:,}/{limit:,} chars. "
                         f"Adding this entry ({len(content)} chars) would exceed the limit. "
+                        f"Your entry was saved to a durable overflow archive so nothing is lost. "
                         f"Consolidate now: use 'replace' to merge overlapping entries into "
                         f"shorter ones or 'remove' stale or less important entries (see "
-                        f"current_entries below), then retry this add — all in this turn."
+                        f"current_entries below), then retry this add to restore it to active memory."
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
+                    "overflow_archive": archived,
                 }
 
             entries.append(content)
@@ -537,15 +567,21 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
             if new_total > limit:
                 current = self._char_count(target)
+                dropped = [(op or {}).get("content", "").strip()
+                           for op in operations if (op or {}).get("action") == "add"]
+                archived = self._archive_overflow(target, dropped)
                 return {
                     "success": False,
                     "error": (
                         f"After applying all {len(operations)} operations, memory would be at "
-                        f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
-                        f"entries in the same batch (see current_entries below), then retry."
+                        f"{new_total:,}/{limit:,} chars -- over the limit. Your new content was saved "
+                        f"to a durable overflow archive so nothing is lost. Remove or shorten more "
+                        f"entries in the same batch (see current_entries below), then retry to restore "
+                        f"it to active memory."
                     ),
                     "current_entries": self._entries_for(target),
                     "usage": f"{current:,}/{limit:,}",
+                    "overflow_archive": archived,
                 }
 
             # Commit.
