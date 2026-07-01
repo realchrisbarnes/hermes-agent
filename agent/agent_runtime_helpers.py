@@ -1143,10 +1143,21 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
                 if cleaned and cleaned not in reasoning_parts:
                     reasoning_parts.append(cleaned)
     
-    # Combine all reasoning parts
+    # Combine all reasoning parts.  Coerce defensively: a provider (or a
+    # malformed / mocked assistant message) can place a non-str value in a
+    # reasoning field, and a bare "\n\n".join() would then raise
+    # "TypeError: sequence item 0: expected str instance, ... found" inside
+    # build_assistant_message, crashing the entire conversation outer loop.
+    # str()-coerce any non-str part and drop parts that empty out.
     if reasoning_parts:
-        return "\n\n".join(reasoning_parts)
-    
+        normalized = [
+            part if isinstance(part, str) else str(part)
+            for part in reasoning_parts
+        ]
+        normalized = [part for part in normalized if part]
+        if normalized:
+            return "\n\n".join(normalized)
+
     return None
 
 

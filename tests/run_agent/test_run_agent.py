@@ -580,6 +580,27 @@ class TestExtractReasoning:
         result = agent._extract_reasoning(msg)
         assert result == "same text"
 
+    def test_non_string_reasoning_part_does_not_crash(self, agent):
+        # Regression: a provider (or a malformed / mocked assistant message)
+        # can place a non-str value in a reasoning field.  A bare
+        # "\n\n".join() then raises "TypeError: sequence item 0: expected str
+        # instance, ... found" INSIDE build_assistant_message, crashing the
+        # whole conversation outer loop (seen live, 41x/24h in errors.log).
+        # extract_reasoning must coerce defensively and never raise.
+        msg = _mock_assistant_msg(reasoning=MagicMock())
+        result = agent._extract_reasoning(msg)  # must not raise
+        assert result is None or isinstance(result, str)
+
+    def test_non_string_part_mixed_with_real_reasoning(self, agent):
+        # A junk non-str part must not discard a real string reasoning part.
+        msg = _mock_assistant_msg(
+            reasoning=MagicMock(),
+            reasoning_content="the real reasoning",
+        )
+        result = agent._extract_reasoning(msg)
+        assert isinstance(result, str)
+        assert "the real reasoning" in result
+
     @pytest.mark.parametrize(
         ("content", "expected"),
         [
