@@ -295,6 +295,15 @@ def _handle_send(args):
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
+    # Operator hard rule: no em/en dashes in user-facing output.  Scrub at the
+    # single outbound chokepoint so every channel (telegram, cron, email, etc.)
+    # and the session mirror all carry the same cleaned text.  Emoji preserved.
+    try:
+        from agent.message_sanitization import _scrub_outbound_dashes
+        message = _scrub_outbound_dashes(message)
+    except Exception:
+        pass
+
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
     target_ref = parts[1].strip() if len(parts) > 1 else None

@@ -39,6 +39,36 @@ def _sanitize_surrogates(text: str) -> str:
     return text
 
 
+# Em dash (U+2014), en dash (U+2013), and horizontal bar (U+2015).  The
+# operator's hard rule is no em/en dashes anywhere in user-facing output
+# (they read as AI-generated).  Scrubbed only on the OUTBOUND user-send
+# path so internal API payloads are untouched.  Emoji and all other
+# Unicode are preserved.
+_RANGE_DASH_RE = re.compile(r'(?<=\d)\s*[–—―]\s*(?=\d)')
+_CLAUSE_DASH_RE = re.compile(r'\s+[–—―]\s+')
+_BARE_DASH_RE = re.compile(r'[–—―]')
+
+
+def _scrub_outbound_dashes(text: str) -> str:
+    """Replace em/en dashes in user-facing text with ASCII-safe equivalents.
+
+    Conservative, order-sensitive rules so the result reads naturally:
+
+    * Between digits (numeric ranges like ``10–20``) -> hyphen ``10-20``.
+    * Spaced clause separator (``X — because Y``) -> comma ``X, because Y``.
+    * Any remaining em/en dash -> hyphen.
+
+    Fast no-op when no such dash is present.  Preserves emoji and every
+    other code point; this is NOT a non-ASCII stripper.
+    """
+    if not text or not _BARE_DASH_RE.search(text):
+        return text
+    text = _RANGE_DASH_RE.sub('-', text)
+    text = _CLAUSE_DASH_RE.sub(', ', text)
+    text = _BARE_DASH_RE.sub('-', text)
+    return text
+
+
 def _sanitize_structure_surrogates(payload: Any) -> bool:
     """Replace surrogate code points in nested dict/list payloads in-place.
 
