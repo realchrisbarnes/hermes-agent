@@ -321,6 +321,70 @@ class MemoryStore:
             logger.warning("memory overflow archive failed for target=%s", target, exc_info=True)
             return None
 
+    def consolidate(self, target: str) -> Dict[str, Any]:
+        """Reabsorb durably-archived overflow entries back into active memory
+        when there is room, so nothing stays stranded in the dead-letter.
+
+        Conservative + reversible by construction:
+          - never deletes a non-duplicate ACTIVE entry (only dedups exact copies);
+          - only removes an overflow entry AFTER its content is present in active
+            memory on disk, so a crash mid-run cannot lose content;
+          - rescans every candidate for injection/exfil before promoting it into
+            the system-prompt path; a flagged entry stays in the archive;
+          - respects the char cap; entries that still do not fit stay archived.
+        Safe to run repeatedly (idempotent).
+        """
+        import re as _re
+        with self._file_lock(self._path_for(target)):
+            bak = self._reload_target(target)
+            if bak:
+                return {"success": False, "error": "external drift; skipped", "drift_backup": bak}
+            base = self._path_for(target)
+            overflow_path = base.with_name(base.name + ".overflow.md")
+            if not overflow_path.exists():
+                return {"success": True, "reabsorbed": 0, "remaining_overflow": 0,
+                        "note": "no overflow archive"}
+
+            entries = list(dict.fromkeys(self._entries_for(target)))
+            limit = self._char_limit(target)
+            raw = overflow_path.read_text(encoding="utf-8")
+            blocks = _re.split(r"(?m)^<!-- overflow .*? -->$", raw)
+            overflow_entries = [b.strip() for b in blocks if b.strip()]
+
+            reabsorbed = 0
+            still: List[str] = []
+            seen_still = set()
+            for oe in overflow_entries:
+                if oe in entries:            # already active -> reconciled, drop from archive
+                    reabsorbed += 1
+                    continue
+                if _scan_memory_content(oe):  # threat -> keep archived, never promote
+                    if oe not in seen_still:
+                        still.append(oe); seen_still.add(oe)
+                    continue
+                candidate = entries + [oe]
+                if len(ENTRY_DELIMITER.join(candidate)) <= limit:
+                    entries = candidate
+                    reabsorbed += 1
+                elif oe not in seen_still:
+                    still.append(oe); seen_still.add(oe)
+
+            # Commit active FIRST (durable) so nothing is lost if the archive
+            # rewrite below fails.
+            self._set_entries(target, entries)
+            self.save_to_disk(target)
+
+            if still:
+                stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                body = "".join(f"\n<!-- overflow {stamp} -->\n{e}\n" for e in still)
+                overflow_path.write_text(body, encoding="utf-8")
+            else:
+                overflow_path.unlink(missing_ok=True)
+
+            return {"success": True, "reabsorbed": reabsorbed,
+                    "remaining_overflow": len(still),
+                    "usage": f"{self._char_count(target):,}/{limit:,}"}
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()

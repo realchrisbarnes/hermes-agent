@@ -326,6 +326,36 @@ class TestMemoryStoreAdd:
         assert "batch fact one that will not fit" in body
         assert "batch fact two that will not fit either" in body
 
+    def test_consolidate_reabsorbs_overflow_when_room(self, store, tmp_path):
+        # Overflow a fact, then free room and consolidate -> the archived fact
+        # returns to active memory and the archive is cleared. Nothing lost.
+        store.add("memory", "x" * 490)
+        store.add("memory", "reabsorb me later")   # rejected -> archived
+        overflow = tmp_path / "MEMORY.md.overflow.md"
+        assert overflow.exists()
+        # free room
+        store.apply_batch("memory", [{"action": "remove", "old_text": "x" * 490}])
+        r = store.consolidate("memory")
+        assert r["success"] is True
+        assert r["reabsorbed"] == 1
+        assert "reabsorb me later" in store.memory_entries
+        assert not overflow.exists()  # fully reconciled -> archive removed
+
+    def test_consolidate_keeps_overflow_that_still_wont_fit(self, store, tmp_path):
+        # If there is still no room, the archived entry stays put (never lost).
+        store.add("memory", "y" * 495)
+        store.add("memory", "still too big to fit right now")  # archived
+        r = store.consolidate("memory")
+        assert r["success"] is True
+        assert r["reabsorbed"] == 0
+        assert r["remaining_overflow"] == 1
+        assert (tmp_path / "MEMORY.md.overflow.md").exists()
+
+    def test_consolidate_noop_without_archive(self, store):
+        r = store.consolidate("memory")
+        assert r["success"] is True
+        assert r["reabsorbed"] == 0
+
     def test_replace_exceeding_limit_returns_consolidation_context(self, store):
         # A replace that blows the budget should mirror the add-overflow shape:
         # echo current_entries + usage and tell the model to retry in-turn.
