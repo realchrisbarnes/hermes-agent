@@ -39,7 +39,11 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
             return self
         def __exit__(self, *_a):
             return False
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
+            # Mirrors the real ddgs 9.x signature text(query, **kwargs); the
+            # provider pins backend= so the fake must accept it. Record the
+            # kwargs so tests can assert the engine pin.
+            fake.last_text_kwargs = {"max_results": max_results, **kwargs}
             if text_sleep is not None:
                 _time.sleep(text_sleep)
             if text_raises is not None:
@@ -47,6 +51,7 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
             for hit in (text_results or []):
                 yield hit
 
+    fake.last_text_kwargs = None
     fake.DDGS = _FakeDDGS
     monkeypatch.setitem(sys.modules, "ddgs", fake)
     return fake
@@ -301,3 +306,25 @@ class TestDDGSSearchOnlyErrors:
         assert result["success"] is False
         assert "search-only" in result["error"].lower()
         assert "duckduckgo" in result["error"].lower() or "ddgs" in result["error"].lower()
+
+
+class TestDDGSEnginePin:
+    def test_backend_is_pinned_to_privacy_engines_not_auto(self, monkeypatch):
+        """ddgs 9.x defaults to backend="auto" which fans queries out across
+        its whole engine roster (google, bing, yandex, ...). The provider is
+        documented as DuckDuckGo search, so the engine list must be pinned:
+        operator queries were observed reaching yandex.ru before the pin
+        (egress snapshot 2026-07-02)."""
+        fake = _install_fake_ddgs(
+            monkeypatch,
+            text_results=[{"title": "t", "href": "https://x", "body": "b"}])
+        monkeypatch.delitem(sys.modules, "plugins.web.ddgs.provider", raising=False)
+        from plugins.web.ddgs.provider import _run_ddgs_search
+
+        _run_ddgs_search("q", 3)
+        kwargs = fake.last_text_kwargs
+        assert kwargs is not None
+        backend = kwargs.get("backend", "auto")
+        assert backend != "auto"
+        assert "yandex" not in backend and "google" not in backend and "bing" not in backend
+        assert "duckduckgo" in backend

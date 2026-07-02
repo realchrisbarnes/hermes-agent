@@ -40,7 +40,14 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
 
     results: list[dict[str, Any]] = []
     with DDGS(timeout=10) as client:
-        for i, hit in enumerate(client.text(query, max_results=safe_limit)):
+        # Pin the engine list. ddgs 9.x defaults to backend="auto", which fans
+        # each query out across its whole engine roster (google, bing, yandex,
+        # yahoo, ...). This provider is documented and selected as DuckDuckGo
+        # search; without the pin, operator queries were observed leaving to
+        # yandex.ru directly (egress snapshot 2026-07-02).
+        for i, hit in enumerate(
+            client.text(query, max_results=safe_limit, backend="duckduckgo, brave, mojeek")
+        ):
             if i >= safe_limit:
                 break
             url = str(hit.get("href") or hit.get("url") or "")
