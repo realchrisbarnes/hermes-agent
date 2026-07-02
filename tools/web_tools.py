@@ -887,6 +887,29 @@ def check_web_search_available() -> bool:
     )
 
 
+def check_web_extract_available() -> bool:
+    """Return True when the selected web_extract backend can service URL fetches.
+
+    Search-only backends such as ddgs, SearXNG, X Search, and Brave free search
+    make web_search usable, but they must not advertise native web_extract.
+    """
+    backend = _get_extract_backend()
+    if backend in _SEARCH_ONLY_BACKENDS:
+        return False
+    return _is_backend_available(backend)
+
+
+def check_web_api_key() -> bool:
+    """Backward-compatible alias for generic web search availability."""
+    return check_web_search_available()
+
+
+def check_auxiliary_model() -> bool:
+    """Check if an auxiliary text model is available for LLM content processing."""
+    client, _, _ = _resolve_web_extract_auxiliary()
+    return client is not None
+
+
 if __name__ == "__main__":
     """
     Simple test/demo when run directly
