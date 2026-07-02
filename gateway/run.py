@@ -144,6 +144,44 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Degraded-fallback transparency (2026-07-02): when the primary chat provider is
+# rate-limited and replies come from the local fallback model, the user must be
+# TOLD, or the sudden persona/quality drop reads as "Bella is broken" (operator
+# asked "why are you speaking differently?"). _resolve_runtime_agent_kwargs
+# maintains this module state on every resolution (asyncio single-process, so a
+# plain dict swap is safe); the platform dispatcher prefixes outgoing replies
+# while it is active. Cleared the moment the primary resolves again.
+_DEGRADED_FALLBACK = {"until": 0.0, "retry_seconds": 0}
+
+
+def _note_primary_healthy() -> None:
+    _DEGRADED_FALLBACK["until"] = 0.0
+
+
+def _note_fallback_active(auth_exc: Exception) -> None:
+    m = re.search(r"retry after (\d+)s", str(auth_exc))
+    secs = int(m.group(1)) if m else 900
+    _DEGRADED_FALLBACK["retry_seconds"] = secs
+    # clamp: never trust a parse into hours of stale banner; re-resolutions
+    # refresh this on every message anyway
+    _DEGRADED_FALLBACK["until"] = time.time() + max(120, min(secs, 7200))
+
+
+def _degraded_fallback_notice() -> str:
+    """One-line honesty banner prepended to replies served by the fallback model.
+
+    Empty string when the primary is healthy (the common case), so callers can
+    prefix unconditionally on truthiness.
+    """
+    if time.time() >= _DEGRADED_FALLBACK["until"]:
+        return ""
+    mins = max(1, int((_DEGRADED_FALLBACK["until"] - time.time()) // 60) + 1)
+    return (
+        "⚡ Heads up: my main model is rate limited for about "
+        f"{mins} more min, so I'm answering from my small local backup brain. "
+        "Expect shorter, simpler replies until I'm back at full power.\n\n"
+    )
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -1794,11 +1832,13 @@ def _resolve_runtime_agent_kwargs() -> dict:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
         fb_config = _try_resolve_fallback_provider()
         if fb_config is not None:
+            _note_fallback_active(auth_exc)
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
+    _note_primary_healthy()
     model_cfg = _get_model_config()
     max_tokens = None
     _env_mt = os.environ.get("HERMES_MAX_TOKENS")
@@ -10989,6 +11029,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "results. This can happen with some models — try again or "
                     "rephrase your question."
                 )
+            # Degraded-fallback honesty: while the primary provider is
+            # rate-limited and the local fallback is answering, say so up front
+            # instead of letting the persona drop read as a malfunction.
+            _deg_notice = _degraded_fallback_notice()
+            if _deg_notice and response and not _intentional_silence \
+                    and not response.startswith(("⚠️", "⏱️", "⚡")):
+                response = _deg_notice + response
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
