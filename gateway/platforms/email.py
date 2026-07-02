@@ -165,7 +165,72 @@ def _is_automated_sender(address: str, headers: dict) -> bool:
         if value and check(value):
             return True
     return False
-    
+
+
+def _header_contains_address(header_value: str, target_addr: str) -> bool:
+    """Return True when an address header includes target_addr.
+
+    This intentionally uses a conservative substring check around parsed email
+    addresses instead of display names. It is only used for delivery-position
+    gating, not authentication.
+    """
+    if not header_value or not target_addr:
+        return False
+    target = target_addr.strip().lower()
+    for part in header_value.split(","):
+        if _extract_email_address(part).lower() == target:
+            return True
+    return target in header_value.lower()
+
+
+def _explicitly_mentions_agent(subject: str, body: str, agent_addr: str) -> bool:
+    """Return True when the email text directly asks the agent to engage.
+
+    A bare occurrence of "Bella" is not enough on email: signatures, quoted
+    replies, AI-disclosure footers, and Cc display names can all contain the
+    agent name.  For CC-only mail, require the name/address plus a nearby action
+    cue so passive context capture stays silent.
+    """
+    haystack = f"{subject or ''}\n{body or ''}".lower()
+    names = {"bella"}
+    if agent_addr and "@" in agent_addr:
+        names.add(agent_addr.split("@", 1)[0].lower())
+    if agent_addr:
+        names.add(agent_addr.lower())
+    action_words = (
+        "please", "pls", "review", "respond", "reply", "answer", "summarize",
+        "analyse", "analyze", "check", "confirm", "handle", "take", "do ",
+        "can you", "could you", "would you", "need you", "help", "draft",
+    )
+    for name in names:
+        if not name:
+            continue
+        for match in re.finditer(rf"(?<![a-z0-9_]){re.escape(name)}(?![a-z0-9_])", haystack):
+            # For CC-only mail, require the action cue to follow the agent name
+            # closely ("Bella, please review..."). A generic "please see
+            # attached" earlier in the message plus a passive signature mention
+            # must remain silent.
+            end = min(len(haystack), match.end() + 100)
+            window_after = haystack[match.end():end]
+            if any(word in window_after for word in action_words):
+                return True
+    return False
+
+
+def _is_email_runtime_status(content: str) -> bool:
+    """Return True for gateway/runtime status text that must not be emailed."""
+    text = (content or "").lstrip()
+    status_prefixes = (
+        "📬 No home channel is set",
+        "ℹ Codex gpt-5.5 caps context",
+        "⟳ compacting context",
+        "🗜️ Compacting context",
+        "⚠️  Session compressed",
+        "⚠️ Gateway",
+    )
+    return any(text.startswith(prefix) for prefix in status_prefixes)
+
+
 def check_email_requirements() -> bool:
     """Check if email platform dependencies are available."""
     addr = os.getenv("EMAIL_ADDRESS")
@@ -857,12 +922,29 @@ class EmailAdapter(BasePlatformAdapter):
 
         subject = msg_data["subject"]
         body = msg_data["body"].strip()
+        to_header = msg_data.get("to", "")
+        cc_header = msg_data.get("cc", "")
+        addressed_to_agent = _header_contains_address(to_header, self._address)
+        cc_to_agent = _header_contains_address(cc_header, self._address)
+        # Run explicit-request detection on the sender's new words, not the
+        # raw body. Raw mail often includes quoted Bella replies, signatures,
+        # and legal/AI disclosure footers that can mention the agent without
+        # asking her to speak.
+        mention_body = _clean_message_text(body, msg_data.get("sender_name") or "") or body
+        explicit_agent_request = _explicitly_mentions_agent(subject, mention_body, self._address)
+        if cc_to_agent and not addressed_to_agent and not explicit_agent_request:
+            logger.info(
+                "[Email] Suppressing CC-only message from %s without explicit agent mention: %s",
+                sender_addr,
+                subject,
+            )
+            return
         attachments = msg_data["attachments"]
 
         # The brain gets only the sender's NEW words: prior quoted chains and
         # signature/legal/marketing footers are noise that wastes context and
         # gets parroted back into replies as ugly fake "history".
-        brain_body = _clean_message_text(body, msg_data.get("sender_name") or "") or body
+        brain_body = mention_body
 
         # Build message text: include subject as context
         text = brain_body
@@ -933,7 +1015,7 @@ class EmailAdapter(BasePlatformAdapter):
         coalesce into a single email (flushed after a quiet period)."""
         # Internal control notices (gateway restart/shutdown broadcasts) are
         # chat-channel UX; over email they read as alarming nonsense to humans.
-        if content.lstrip().startswith("⚠️ Gateway"):
+        if _is_email_runtime_status(content):
             logger.info("[Email] Suppressed control notice to %s", chat_id)
             return SendResult(success=True, message_id="suppressed-control-notice")
         if self._coalesce_s <= 0:

@@ -376,7 +376,16 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    platform_value = _gateway_platform_value(platform)
+    # Email is a high-trust, external communication surface. Runtime status
+    # bubbles such as context-compression notices, home-channel setup nudges,
+    # and progress text are useful in chat but read like unsolicited replies in
+    # a mailbox. Never deliver status callbacks over email; only final assistant
+    # content may flow through the email adapter, and that path has its own
+    # explicit reply gates.
+    if platform_value == "email":
+        return None
+    if platform_value != "telegram":
         return text
 
     text = _redact_gateway_user_facing_secrets(text)

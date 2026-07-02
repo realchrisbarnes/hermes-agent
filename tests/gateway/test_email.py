@@ -312,6 +312,118 @@ class TestDispatchMessage(unittest.TestCase):
         self.assertIn("[Subject: Help with Python]", captured_events[0].text)
         self.assertIn("How do I use lists?", captured_events[0].text)
 
+    def test_cc_only_without_agent_mention_is_silent(self):
+        """CC-only emails should be observed silently unless the agent is mentioned."""
+        import asyncio
+        adapter = self._make_adapter()
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+        msg_data = {
+            "uid": b"cc1",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "Proposal FYI",
+            "message_id": "<cc1@test.com>",
+            "in_reply_to": "",
+            "body": "Please see attached for Lance and Betsy.",
+            "attachments": [],
+            "date": "",
+            "to": "Lance <lance@test.com>, Betsy <betsy@test.com>",
+            "cc": "Hermes <hermes@test.com>",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        self.assertEqual(captured_events, [])
+
+    def test_cc_only_with_agent_mention_dispatches(self):
+        """CC-only emails that directly mention the agent should still dispatch."""
+        import asyncio
+        adapter = self._make_adapter()
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+        msg_data = {
+            "uid": b"cc2",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "Proposal FYI",
+            "message_id": "<cc2@test.com>",
+            "in_reply_to": "",
+            "body": "Hermes, please review this and respond.",
+            "attachments": [],
+            "date": "",
+            "to": "Lance <lance@test.com>, Betsy <betsy@test.com>",
+            "cc": "Hermes <hermes@test.com>",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        self.assertEqual(len(captured_events), 1)
+
+    def test_cc_only_with_passive_signature_bella_mention_is_silent(self):
+        """A passive Bella/signature mention in CC-only mail is not reply authorization."""
+        import asyncio
+        adapter = self._make_adapter()
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+        msg_data = {
+            "uid": b"cc3",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "Proposal FYI",
+            "message_id": "<cc3@test.com>",
+            "in_reply_to": "",
+            "body": (
+                "Please see attached for David.\n\n"
+                "Bella AI\nDirector of Strategic Operations\n"
+                "AI Assistance and Compliance Notice: this email may have been processed by Bella."
+            ),
+            "attachments": [],
+            "date": "",
+            "to": "David <david@test.com>",
+            "cc": "Bella AI <hermes@test.com>",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        self.assertEqual(captured_events, [])
+
+    def test_cc_only_to_agent_address_display_name_is_silent(self):
+        """The agent address in Cc header alone must not count as a direct request."""
+        import asyncio
+        adapter = self._make_adapter()
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+        msg_data = {
+            "uid": b"cc4",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "TMH Group Admin Flow",
+            "message_id": "<cc4@test.com>",
+            "in_reply_to": "",
+            "body": "David, great connecting with you today. Please see attached for context.",
+            "attachments": [],
+            "date": "",
+            "to": "David <david@test.com>",
+            "cc": "Sean <sean@test.com>, Bella AI <hermes@test.com>",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        self.assertEqual(captured_events, [])
+
     def test_reply_subject_not_duplicated(self):
         """Re: subjects should not be prepended to body."""
         import asyncio
@@ -737,6 +849,21 @@ class TestSendMethods(unittest.TestCase):
             mock_server.login.assert_called_once_with("hermes@test.com", "secret")
             mock_server.send_message.assert_called_once()
             mock_server.quit.assert_called_once()
+
+    def test_send_suppresses_runtime_status_notices(self):
+        """Runtime/status notices should never be delivered as email replies."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._coalesce_s = 0
+        adapter._send_now = AsyncMock(return_value=SendResult(success=True))
+
+        result = asyncio.run(
+            adapter.send("user@test.com", "ℹ Codex gpt-5.5 caps context at 272K")
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "suppressed-control-notice")
+        adapter._send_now.assert_not_called()
 
     def test_send_failure_returns_error(self):
         """SMTP failure should return SendResult with error (immediate path)."""
