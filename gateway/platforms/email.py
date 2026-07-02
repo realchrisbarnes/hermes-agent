@@ -605,7 +605,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
 
         # Map chat_id (sender email) -> last subject + message-id for threading
-        self._thread_context: Dict[str, Dict[str, str]] = {}
+        self._thread_context: Dict[str, Dict[str, Any]] = {}
 
         # Coalesce rapid agent message bursts into ONE email. Chat brains often
         # emit several short messages per turn; on chat platforms that is fine,
@@ -981,6 +981,10 @@ class EmailAdapter(BasePlatformAdapter):
             "body_html": msg_data.get("body_html", ""),
             "to": msg_data.get("to", ""),
             "cc": msg_data.get("cc", ""),
+            # Defense-in-depth for outbound email: send() must only reply to
+            # threads that passed the inbound response gate. A future bug that
+            # bypasses dispatch gating should still fail closed at SMTP egress.
+            "response_allowed": True,
         }
 
         source = self.build_source(
@@ -1004,6 +1008,17 @@ class EmailAdapter(BasePlatformAdapter):
         logger.info("[Email] New message from %s: %s", sender_addr, subject)
         await self.handle_message(event)
 
+    def _reply_is_allowed(self, chat_id: str) -> bool:
+        """Return True only for recipients whose inbound thread passed gates."""
+        ctx = self._thread_context.get(chat_id, {})
+        if ctx.get("response_allowed") is True:
+            return True
+        logger.warning(
+            "[Email] Suppressing outbound reply to %s because no inbound response gate passed",
+            chat_id,
+        )
+        return False
+
     async def send(
         self,
         chat_id: str,
@@ -1018,6 +1033,8 @@ class EmailAdapter(BasePlatformAdapter):
         if _is_email_runtime_status(content):
             logger.info("[Email] Suppressed control notice to %s", chat_id)
             return SendResult(success=True, message_id="suppressed-control-notice")
+        if not self._reply_is_allowed(chat_id):
+            return SendResult(success=True, message_id="suppressed-response-gate")
         if self._coalesce_s <= 0:
             return await self._send_now(chat_id, content, reply_to)
         self._outbox.setdefault(chat_id, []).append(content)
@@ -1175,6 +1192,8 @@ class EmailAdapter(BasePlatformAdapter):
         """
         if not images:
             return
+        if not self._reply_is_allowed(chat_id):
+            return
 
         from urllib.parse import unquote as _unquote
 
@@ -1278,6 +1297,8 @@ class EmailAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a file as an email attachment."""
+        if not self._reply_is_allowed(chat_id):
+            return SendResult(success=True, message_id="suppressed-response-gate")
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(

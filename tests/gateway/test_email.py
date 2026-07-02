@@ -830,10 +830,15 @@ class TestSendMethods(unittest.TestCase):
             adapter = EmailAdapter(PlatformConfig(enabled=True))
         return adapter
 
+    def _allow_reply(self, adapter, chat_id="user@test.com"):
+        adapter._thread_context[chat_id] = {"response_allowed": True}
+        return adapter
+
     def test_send_calls_smtp(self):
         """send() should use SMTP to deliver email (immediate path)."""
         import asyncio
         adapter = self._make_adapter()
+        self._allow_reply(adapter)
         adapter._coalesce_s = 0  # immediate send, no burst buffering
 
         with patch("smtplib.SMTP") as mock_smtp:
@@ -865,10 +870,24 @@ class TestSendMethods(unittest.TestCase):
         self.assertEqual(result.message_id, "suppressed-control-notice")
         adapter._send_now.assert_not_called()
 
+    def test_send_without_inbound_response_gate_is_suppressed(self):
+        """Outbound SMTP must fail closed unless inbound delivery gates passed."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._coalesce_s = 0
+        adapter._send_now = AsyncMock(return_value=SendResult(success=True))
+
+        result = asyncio.run(adapter.send("user@test.com", "I should not send"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "suppressed-response-gate")
+        adapter._send_now.assert_not_called()
+
     def test_send_failure_returns_error(self):
         """SMTP failure should return SendResult with error (immediate path)."""
         import asyncio
         adapter = self._make_adapter()
+        self._allow_reply(adapter)
         adapter._coalesce_s = 0  # immediate send, no burst buffering
 
         with patch("smtplib.SMTP") as mock_smtp:
@@ -902,6 +921,7 @@ class TestSendMethods(unittest.TestCase):
         import asyncio
         import tempfile
         adapter = self._make_adapter()
+        self._allow_reply(adapter)
 
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
             f.write(b"Test document content")
@@ -1693,6 +1713,7 @@ class TestOutgoingHygiene(unittest.TestCase):
 
         async def run():
             adapter = _adapter_for_send()
+            adapter._thread_context["chris@test.com"] = {"response_allowed": True}
             adapter._coalesce_s = 0.1
             with patch.object(adapter, "_send_now", new=AsyncMock()) as send_now:
                 await adapter.send("chris@test.com", "part one")
