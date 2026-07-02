@@ -413,7 +413,9 @@ class TestEmailMultiImage:
         a._password = "secret"
         a._smtp_host = "smtp.example.com"
         a._smtp_port = 587
-        a._thread_context = {}
+        # The fail-closed reply gate (no inbound thread that passed gates ->
+        # no outbound email) requires response_allowed on the thread context.
+        a._thread_context = {"user@example.com": {"response_allowed": True}}
         return a
 
     def test_local_files_attached_in_single_email(self, adapter, tmp_path):
@@ -436,6 +438,16 @@ class TestEmailMultiImage:
         assert to_addr == "user@example.com"
         assert len(file_paths) == 3
         assert "alt 0" in body
+
+    def test_ungated_recipient_is_suppressed(self, adapter, tmp_path):
+        """Fail-closed: no inbound response gate -> no outbound email at all."""
+        p = tmp_path / "img.png"
+        p.write_bytes(b"\x89PNG" + b"\x00" * 20)
+        with patch.object(
+            adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
+        ) as mock_send:
+            _run(adapter.send_multiple_images("stranger@example.com", [(f"file://{p}", "alt")]))
+        mock_send.assert_not_called()
 
     def test_remote_urls_linked_in_body(self, adapter, tmp_path):
         """Remote URL images get their URL appended to the body, no attachment."""
