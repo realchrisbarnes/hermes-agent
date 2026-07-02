@@ -16831,8 +16831,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model, runtime_kwargs.get("provider"), session_key or "",
                 )
             except Exception as exc:
+                # Not every resolution failure is an auth failure: a primary-provider
+                # 429/quota window (with no reachable fallback) lands here too, and
+                # labeling it "authentication failed" misleads users and pages
+                # operators for a self-recovering condition (2026-07-02 incident).
+                # _gateway_provider_error_reply maps auth vs rate-limit vs policy vs
+                # generic, and keeps the raw provider text out of chat.
                 return {
-                    "final_response": f"⚠️ Provider authentication failed: {exc}",
+                    "final_response": _gateway_provider_error_reply(str(exc)),
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
