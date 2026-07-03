@@ -230,7 +230,10 @@ def _get_backend() -> str:
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
-        ("xai", _is_backend_available("xai")),
+        # xAI is deliberately absent: a stray XAI_API_KEY (often set for chat
+        # inference) must not silently re-route web_search through Grok.
+        # Explicit `web.backend: xai` config and the registry's
+        # single-provider shortcut still select it.
     )
     for backend, available in backend_candidates:
         if available:

@@ -1050,45 +1050,59 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         tool_call_counter = [0]
 
         def _run():
-            with patch(
-                "model_tools.handle_function_call",
-                side_effect=_mock_handle_function_call,
-            ):
-                _rpc_server_loop(
-                    listener,
-                    "test-task",
-                    tool_call_log,
-                    tool_call_counter,
-                    max_tool_calls=10,
-                    allowed_tools=frozenset({"terminal"}),
-                    stop_event=stop_event,
-                    rpc_token=rpc_token,
-                )
+            _rpc_server_loop(
+                listener,
+                "test-task",
+                tool_call_log,
+                tool_call_counter,
+                max_tool_calls=10,
+                allowed_tools=frozenset({"terminal"}),
+                stop_event=stop_event,
+                rpc_token=rpc_token,
+            )
 
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
+        # mock.patch mutates process-global state, so it must enter/exit on
+        # the MAIN thread: entered inside the worker, a thread that outlives
+        # join(timeout=...) keeps the patch active into later tests, and two
+        # overlapping patches restore each other's MagicMock as the
+        # "original", leaving model_tools.handle_function_call mocked for
+        # the rest of the process.
+        with patch(
+            "model_tools.handle_function_call",
+            side_effect=_mock_handle_function_call,
+        ):
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
 
-        responses = []
-        try:
-            for req in requests:
-                cli.sendall((json.dumps(req) + "\n").encode())
-            cli.settimeout(5)
-            buf = b""
-            while len(responses) < len(requests):
-                chunk = cli.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.strip()
-                    if line:
-                        responses.append(json.loads(line.decode()))
-        finally:
-            stop_event.set()
-            cli.close()
-            srv.close()
-            t.join(timeout=5)
+            responses = []
+            try:
+                for req in requests:
+                    cli.sendall((json.dumps(req) + "\n").encode())
+                cli.settimeout(5)
+                buf = b""
+                while len(responses) < len(requests):
+                    chunk = cli.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if line:
+                            responses.append(json.loads(line.decode()))
+            finally:
+                stop_event.set()
+                # shutdown() (unlike close()) wakes a peer blocked in recv()
+                # on macOS, so the server thread exits before join() instead
+                # of sitting in conn.recv until its 300s timeout.
+                for sock_ in (cli, srv):
+                    try:
+                        sock_.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                cli.close()
+                srv.close()
+                t.join(timeout=5)
         return responses
 
     def test_missing_token_rejected(self):

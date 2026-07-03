@@ -360,13 +360,19 @@ class TestBackendSelection:
              patch("tools.web_tools._ddgs_package_importable", return_value=False):
             assert _get_backend() == "firecrawl"
 
-    def test_fallback_xai_credentials_selects_xai(self):
-        """No keyed/free backend but xAI credentials exist → 'xai'."""
+    def test_fallback_xai_credentials_do_not_select_xai(self):
+        """xAI creds alone must NOT reroute the no-config chain to Grok.
+
+        Keeping a stray XAI_API_KEY (often set for chat inference) out of
+        the legacy candidate chain is deliberate — see
+        test_web_providers_xai.py::TestXAIBackendWiring. The chain falls
+        through to the 'firecrawl' backward-compat default instead.
+        """
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch("tools.web_tools._ddgs_package_importable", return_value=False), \
              patch("tools.web_tools._is_backend_available", side_effect=lambda backend: backend == "xai"):
-            assert _get_backend() == "xai"
+            assert _get_backend() == "firecrawl"
 
     def test_invalid_config_falls_through_to_fallback(self):
         """web.backend=invalid → ignored, uses key-based fallback."""
