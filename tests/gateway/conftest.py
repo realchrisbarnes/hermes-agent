@@ -38,6 +38,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# Fresh-process emulation for single-process runs: reset known
+# process-global registries at each test-file boundary so plain
+# ``pytest tests/gateway/`` matches the per-file subprocess runner.
+from tests._global_state import _fresh_process_globals  # noqa: F401
+
 
 def make_async_session_db(sync_mock=None):
     """Wrap a sync mock SessionDB in AsyncSessionDB so gateway code that awaits
@@ -231,6 +236,25 @@ def _ensure_discord_mock() -> None:
     sys.modules["discord.ext"] = ext_mod
     sys.modules["discord.ext.commands"] = commands_mod
 
+
+# Prefer the real ``telegram`` library when it's installed: importing it here
+# makes every guarded ``_ensure_telegram_mock`` (this conftest's and each test
+# file's) skip, so the whole directory uses the real library deterministically.
+# Without this, real-vs-mock hinges on which file's module-level import runs
+# first — fine under the per-file subprocess runner, but a cross-file coin-flip
+# in single-process runs (a mock ``ParseMode`` is a plain string, so ``repr()``
+# drops the ``MARKDOWN_V2`` name that the escaping tests assert on). Falls back
+# to the mock below when the library isn't installed (e.g. CI).
+#
+# ``discord`` is deliberately NOT pre-imported: several discord tests assert
+# mock-specific behavior and are written to run against the mock, so forcing
+# the real library would break them. Its guarded mock stays the default.
+for _real_lib in ("telegram", "telegram.ext", "telegram.constants",
+                  "telegram.request"):
+    try:
+        __import__(_real_lib)
+    except Exception:
+        pass
 
 # Run at collection time — before any test file's module-level imports.
 _ensure_telegram_mock()

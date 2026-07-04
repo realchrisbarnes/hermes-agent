@@ -4818,10 +4818,15 @@ class TestRunConversation:
     def test_tiny_structural_length_fragments_return_actionable_error(self, agent):
         """Do not surface continuation junk like ``{`` / fences as final chat text."""
         self._setup_agent(agent)
+        # The length-continuation loop makes up to 4 attempts (retries < 4) before
+        # giving up, so supply 4 tiny truncated fragments — one per attempt. With
+        # only 3 the loop makes a 4th create() call, exhausting side_effect and
+        # surfacing a StopIteration retry error instead of the truncated-output path.
         agent.client.chat.completions.create.side_effect = [
             _mock_response(content="{", finish_reason="length"),
             _mock_response(content="I", finish_reason="length"),
             _mock_response(content="```", finish_reason="length"),
+            _mock_response(content="}", finish_reason="length"),
         ]
 
         with (

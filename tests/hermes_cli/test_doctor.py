@@ -52,10 +52,14 @@ class TestProviderEnvDetection:
 
 
 def test_doctor_required_api_disabled_ignores_default_off_toolsets():
+    # ``spotify`` stands in for a default-off toolset (was ``moa`` until
+    # #46081 reclassified MoA from a toolset to a selectable virtual model and
+    # dropped it from _DEFAULT_OFF_TOOLSETS). Any current default-off toolset
+    # exercises the same filter.
     missing = [
         {"name": "discord", "env_vars": ["DISCORD_BOT_TOKEN"]},
         {"name": "discord_admin", "env_vars": ["DISCORD_BOT_TOKEN"]},
-        {"name": "moa", "env_vars": ["OPENROUTER_API_KEY"]},
+        {"name": "spotify", "env_vars": ["SPOTIFY_CLIENT_ID"]},
         {"name": "custom_required", "env_vars": ["CUSTOM_REQUIRED_API_KEY"]},
     ]
 

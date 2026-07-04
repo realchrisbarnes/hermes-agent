@@ -21,6 +21,15 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_telegram_mock():
+    # Skip when the real python-telegram-bot library is installed: overwriting
+    # sys.modules["telegram"] with a mock at import time corrupts the shared
+    # module for every later-COLLECTED file in a single-process run (e.g.
+    # test_telegram_approval_buttons then binds a plain-string ParseMode
+    # instead of the real enum). Harmless under the per-file subprocess runner,
+    # but a cross-file leak otherwise. Matches the guarded pattern already used
+    # by the discord mocks and the gateway conftest's _ensure_telegram_mock.
+    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
+        return
     telegram_mod = MagicMock()
     telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
 

@@ -260,7 +260,13 @@ def test_resolve_runtime_provider_codex(monkeypatch):
     assert resolved["requested_provider"] == "openai-codex"
 
 
-def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
+def test_resolve_runtime_provider_qwen_oauth(monkeypatch, tmp_path):
+    # Qwen creds live at ``Path.home()/.qwen/oauth_creds.json`` (auth.py), which
+    # the shared conftest deliberately does NOT isolate (it leaves HOME alone).
+    # Point HOME at an empty tmp dir so ``load_pool('qwen-oauth')`` finds no
+    # credentials and the resolver takes the ``resolve_qwen_runtime_credentials``
+    # path this test patches — instead of a real ~/.qwen on the dev box.
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
     monkeypatch.setattr(
         rp,
@@ -317,10 +323,14 @@ def test_resolve_provider_alias_qwen(monkeypatch):
     assert rp.resolve_provider("qwen-cli") == "qwen-oauth"
 
 
-def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
+def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch, tmp_path):
     """When requested_provider is 'auto' and Qwen creds fail, fall through."""
     from hermes_cli.auth import AuthError
 
+    # Isolate HOME so ``load_pool('qwen-oauth')`` doesn't pick up a real
+    # ~/.qwen/oauth_creds.json on the dev box (which would satisfy the pool path
+    # and bypass the patched ``resolve_qwen_runtime_credentials`` failure below).
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
     monkeypatch.setattr(
         rp,

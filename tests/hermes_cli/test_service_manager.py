@@ -25,8 +25,24 @@ from hermes_cli.service_manager import (
 
 
 def _expected_s6_event_dir_mode() -> int:
-    # Darwin strips the setgid bit from these tmp dirs; Linux/s6 keeps it.
+    # The helper chmods event/ to 03730 (setgid + g+rwx + sticky). Whether the
+    # setgid bit survives on Darwin is not deterministic: chmod() clears S_ISGID
+    # unless the process's effective/supplementary group owns the tmp dir, which
+    # varies by machine (CI runner vs. a dev box whose group owns /var/folders).
+    # So on Darwin we assert only the stable bits and mask setgid out of the
+    # actual mode via _event_dir_mode(); Linux/s6 always keep 03730.
     return 0o1730 if sys.platform == "darwin" else 0o3730
+
+
+def _event_dir_mode(st_mode: int) -> int:
+    """Return the comparable permission bits, ignoring Darwin's non-deterministic
+    setgid stickiness (see _expected_s6_event_dir_mode)."""
+    import stat as _stat
+
+    mode = _stat.S_IMODE(st_mode)
+    if sys.platform == "darwin":
+        mode &= ~_stat.S_ISGID
+    return mode
 
 
 # ---------------------------------------------------------------------------
@@ -457,7 +473,7 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # Top-level event/ — s6-svlisten1 event subscription dir.
     event = svc_dir / "event"
     assert event.is_dir(), "missing top-level event/"
-    assert stat.S_IMODE(event.stat().st_mode) == _expected_s6_event_dir_mode(), (
+    assert _event_dir_mode(event.stat().st_mode) == _expected_s6_event_dir_mode(), (
         f"event/ mode = {oct(event.stat().st_mode)}, want {oct(_expected_s6_event_dir_mode())}"
     )
 
@@ -469,7 +485,7 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # supervise/event/.
     supervise_event = supervise / "event"
     assert supervise_event.is_dir(), "missing supervise/event/"
-    assert stat.S_IMODE(supervise_event.stat().st_mode) == _expected_s6_event_dir_mode()
+    assert _event_dir_mode(supervise_event.stat().st_mode) == _expected_s6_event_dir_mode()
 
     # supervise/control FIFO.
     control = supervise / "control"
@@ -504,7 +520,7 @@ def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
     log_control = log_supervise / "control"
 
     assert log_event.is_dir()
-    assert stat.S_IMODE(log_event.stat().st_mode) == _expected_s6_event_dir_mode()
+    assert _event_dir_mode(log_event.stat().st_mode) == _expected_s6_event_dir_mode()
     assert log_supervise.is_dir()
     assert log_supervise_event.is_dir()
     assert log_control.exists() and stat.S_ISFIFO(log_control.stat().st_mode)

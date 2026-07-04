@@ -5279,7 +5279,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         if "_config_version" not in config and "config_version" in config:
             config["_config_version"] = current_ver
             config.pop("config_version", None)
-            save_config(config)
+            _persist_migration(config)
     
     # ── Version 3 → 4: migrate tool progress from .env to config.yaml ──
     if current_ver < 4:

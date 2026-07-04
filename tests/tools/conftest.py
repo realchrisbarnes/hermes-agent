@@ -7,69 +7,17 @@ providers before each test and resets the registry afterwards — tests that
 depend on the registry being populated should use it explicitly or via
 ``@pytest.mark.usefixtures("web_registry_populated")``.
 
-The ``_fresh_process_globals`` module-scoped janitor below emulates that
-per-file isolation when the whole directory runs in ONE process (plain
+The ``_fresh_process_globals`` module-scoped janitor (shared across
+directories in ``tests/_global_state.py``) emulates that per-file
+isolation when the whole directory runs in ONE process (plain
 ``pytest tests/tools/``), so direct runs match the canonical runner.
 """
 
-import sys
 from unittest.mock import patch
 
 import pytest
 
-
-def _reset_cross_file_globals() -> None:
-    """Restore the known process-global registries to fresh-process state.
-
-    ``scripts/run_tests_parallel.py`` gives every test file its own
-    interpreter, so these module-level dicts/ContextVars start empty per
-    file.  A plain ``pytest tests/tools/`` run shares one process across
-    all files, and state legitimately written by one file's tests (live
-    cwd tracking, session identity, sudo-password scopes) shadows the
-    env-var fixtures of later files — e.g. a leaked
-    ``_file_ops_cache["default"]`` beats ``TERMINAL_CWD`` in
-    ``_resolve_base_dir``, and session ContextVars pinned by
-    ``clear_session_vars`` suppress ``monkeypatch.setenv`` forever (see
-    ``get_session_env``).  Only touch modules that are already imported:
-    an unimported module has no leaked state, and importing it here would
-    change what "fresh process" means for the file under test.
-    """
-    file_tools = sys.modules.get("tools.file_tools")
-    if file_tools is not None:
-        with file_tools._file_ops_lock:
-            file_tools._file_ops_cache.clear()
-            file_tools._last_known_cwd.clear()
-
-    terminal_tool = sys.modules.get("tools.terminal_tool")
-    if terminal_tool is not None:
-        with terminal_tool._env_lock:
-            terminal_tool._active_environments.clear()
-        terminal_tool._task_env_overrides.clear()
-        with terminal_tool._sudo_password_cache_lock:
-            terminal_tool._sudo_password_cache.clear()
-
-    session_context = sys.modules.get("gateway.session_context")
-    if session_context is not None:
-        for var in session_context._VAR_MAP.values():
-            var.set(session_context._UNSET)
-        session_context._SESSION_ASYNC_DELIVERY.set(session_context._UNSET)
-        session_context._session_context_engaged = False
-
-    runtime_cwd = sys.modules.get("agent.runtime_cwd")
-    if runtime_cwd is not None:
-        runtime_cwd._SESSION_CWD.set(runtime_cwd._UNSET)
-
-
-@pytest.fixture(autouse=True, scope="module")
-def _fresh_process_globals():
-    """Start every test FILE with fresh-process globals (see above).
-
-    Module-scoped on purpose: intra-file ordering stays the test author's
-    responsibility (matching the per-file subprocess runner); only
-    cross-FILE leakage is neutralized.
-    """
-    _reset_cross_file_globals()
-    yield
+from tests._global_state import _fresh_process_globals  # noqa: F401
 
 
 def register_all_web_providers():

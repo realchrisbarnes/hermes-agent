@@ -290,7 +290,7 @@ async def test_marker_missing_fresh_boot_allows_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
     runner._booted_from_restart = False
     runner._startup_time = time.time()
@@ -298,7 +298,8 @@ async def test_marker_missing_fresh_boot_allows_restart(tmp_path, monkeypatch):
     event = _make_restart_event(update_id=100)
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert result == ""
+    assert any("Restarting gateway" in message for message in adapter.sent)
     runner.request_restart.assert_called_once()
 
 
@@ -312,7 +313,7 @@ async def test_marker_missing_booted_from_restart_but_old_process_allows(tmp_pat
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
-    runner, _adapter = make_restart_runner()
+    runner, adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
     runner._booted_from_restart = True
     runner._startup_time = time.time() - 120  # well past the 60s window
@@ -320,5 +321,6 @@ async def test_marker_missing_booted_from_restart_but_old_process_allows(tmp_pat
     event = _make_restart_event(update_id=100)
     result = await runner._handle_restart_command(event)
 
-    assert "Restarting gateway" in result
+    assert result == ""
+    assert any("Restarting gateway" in message for message in adapter.sent)
     runner.request_restart.assert_called_once()
