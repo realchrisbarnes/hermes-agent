@@ -1451,6 +1451,21 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+
+    def _compression_positive_int(key: str, default: int) -> int:
+        value = _compression_cfg.get(key, default)
+        if isinstance(value, bool):
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    compression_auto_warn_at = _compression_positive_int("auto_warn_at", 3)
+    compression_auto_hard_limit = _compression_positive_int("auto_hard_limit", 5)
+    if compression_auto_warn_at > compression_auto_hard_limit:
+        compression_auto_warn_at = compression_auto_hard_limit
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -1698,6 +1713,8 @@ def init_agent(
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
+            auto_compression_warn_at=compression_auto_warn_at,
+            auto_compression_hard_limit=compression_auto_hard_limit,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

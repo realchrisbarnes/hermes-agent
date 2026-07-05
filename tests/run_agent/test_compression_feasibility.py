@@ -232,7 +232,10 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
     """
 
     class _StubCompressor:
+        init_kwargs = None
+
         def __init__(self, *args, **kwargs):
+            type(self).init_kwargs = kwargs
             self.context_length = 200_000
             self.threshold_tokens = 100_000
             self.threshold_percent = 0.50
@@ -244,6 +247,10 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
             return None
 
     cfg = {
+        "compression": {
+            "auto_warn_at": 8,
+            "auto_hard_limit": 25,
+        },
         "auxiliary": {
             "compression": {
                 "context_length": 1_000_000,
@@ -259,7 +266,7 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
-        patch("run_agent.ContextCompressor", new=_StubCompressor),
+        patch("agent.agent_init.ContextCompressor", new=_StubCompressor),
         patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(mock_client, "custom/big-model")),
         patch("agent.model_metadata.get_model_context_length", return_value=1_000_000) as mock_ctx_len,
     ):
@@ -275,6 +282,9 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
         # because the threshold-derivation logic at construction time
         # consults it).
         assert agent._aux_compression_context_length_config == 1_000_000
+        assert _StubCompressor.init_kwargs is not None
+        assert _StubCompressor.init_kwargs["auto_compression_warn_at"] == 8
+        assert _StubCompressor.init_kwargs["auto_compression_hard_limit"] == 25
 
         # The expensive feasibility probe is deferred. Drive it manually
         # to validate the call shape still forwards the override correctly.

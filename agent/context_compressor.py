@@ -911,6 +911,17 @@ class ContextCompressor(ContextEngine):
         return ivalue if ivalue > 0 else None
 
     @staticmethod
+    def _coerce_positive_int(value: Any, default: int) -> int:
+        """Normalize optional positive integer config with a safe default."""
+        if isinstance(value, bool):
+            return default
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            return default
+        return ivalue if ivalue > 0 else default
+
+    @staticmethod
     def _compute_threshold_tokens(
         context_length: int, threshold_percent: float, max_tokens: int | None = None,
     ) -> int:
@@ -968,6 +979,8 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
+        auto_compression_warn_at: int | None = None,
+        auto_compression_hard_limit: int | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -1007,8 +1020,16 @@ class ContextCompressor(ContextEngine):
             self.context_length, threshold_percent, self.max_tokens,
         )
         self.compression_count = 0
-        self.auto_compression_warn_at = _AUTO_COMPRESSION_WARN_AT
-        self.auto_compression_hard_limit = _AUTO_COMPRESSION_HARD_LIMIT
+        self.auto_compression_warn_at = self._coerce_positive_int(
+            auto_compression_warn_at,
+            _AUTO_COMPRESSION_WARN_AT,
+        )
+        self.auto_compression_hard_limit = self._coerce_positive_int(
+            auto_compression_hard_limit,
+            _AUTO_COMPRESSION_HARD_LIMIT,
+        )
+        if self.auto_compression_warn_at > self.auto_compression_hard_limit:
+            self.auto_compression_warn_at = self.auto_compression_hard_limit
 
         # Derive token budgets: ratio is relative to the threshold, not total context
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
