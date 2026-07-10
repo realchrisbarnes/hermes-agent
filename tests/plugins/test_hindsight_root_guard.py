@@ -62,6 +62,7 @@ def test_local_embedded_starts_daemon_as_non_root(monkeypatch):
     """As a non-root user, the daemon-start thread IS spawned."""
     provider = _make_local_embedded_provider(monkeypatch)
     monkeypatch.setattr(hindsight.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr("tools.lazy_deps.feature_missing", lambda _feature: ())
 
     started = threading.Event()
     monkeypatch.setattr(

@@ -51,6 +51,10 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent.image_routing import (
+    _DIRECT_PROVIDERS_WITHOUT_VISION as _PROVIDERS_WITHOUT_VISION,
+)
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -451,11 +455,6 @@ _PROVIDER_VISION_MODELS: Dict[str, str] = {
 # api.kimi.com/coding (Anthropic Messages wire) which Kimi's own docs
 # describe as having no image_in capability. Vision lives on the separate
 # Kimi Platform (api.moonshot.ai, OpenAI-wire, pay-as-you-go).  See #17076.
-_PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
-    "kimi-coding",
-    "kimi-coding-cn",
-})
-
 # OpenRouter app attribution headers (base — always sent).
 # `X-Title` is the canonical attribution header OpenRouter's dashboard
 # reads; the previous `X-OpenRouter-Title` label was not recognized there.
@@ -4766,12 +4765,14 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     don't silently regress to text-only.
     """
     try:
-        from agent.image_routing import _lookup_supports_vision
+        from agent.image_routing import _resolve_vision_capability
         from hermes_cli.config import load_config
     except ImportError:
         return True
     try:
-        supports = _lookup_supports_vision(provider, model, load_config())
+        supports = _resolve_vision_capability(
+            provider, model or "", load_config()
+        )
     except Exception:  # pragma: no cover - defensive
         return True
     if supports is None:
@@ -4909,19 +4910,6 @@ def resolve_vision_provider_client(
                         main_provider, default_model or resolved_model or main_model,
                     )
                     return _finalize(main_provider, sync_client, default_model)
-            elif main_provider in _PROVIDERS_WITHOUT_VISION:
-                # Kimi Coding Plan's /coding endpoint (Anthropic Messages wire)
-                # does not accept image input — Kimi's own docs say "Current
-                # model does not support image input, switch to a model with
-                # image_in capability" and vision lives on the separate Kimi
-                # Platform (api.moonshot.ai). Skip the main provider and fall
-                # through to the aggregator chain instead of returning a
-                # client that will 404 on every vision request (#17076).
-                logger.debug(
-                    "Vision auto-detect: skipping main provider %s (no "
-                    "vision support) — falling through to aggregator chain",
-                    main_provider,
-                )
             elif not _main_model_supports_vision(main_provider, vision_model):
                 # The main model is known to be text-only (e.g. DeepSeek V4,
                 # gpt-oss-120b without vision). Building a client and sending

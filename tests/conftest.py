@@ -466,6 +466,10 @@ def _package_manager_command(args) -> bool:
                 continue
             break
         return _package_manager_command(remaining)
+    if executable == "uv" and len(tokens) == 2 and tokens[1] in {
+        "--version", "version", "--help", "help",
+    }:
+        return False
     if executable in {"pip", "pip3", "pipx", "poetry", "pdm", "uv"}:
         return True
     return (

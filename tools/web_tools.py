@@ -192,6 +192,28 @@ def _registered_web_provider_available(backend: str):
         return False
 
 
+def _registered_web_capability_available(backend: str, capability: str):
+    """Capability-specific availability, or None when unregistered."""
+    provider = _registered_web_provider(backend)
+    if provider is None:
+        return None
+    try:
+        supported = (
+            provider.supports_search()
+            if capability == "search"
+            else provider.supports_extract()
+        )
+        return bool(supported and provider.is_available())
+    except Exception as exc:  # noqa: BLE001 — broken plugin is unavailable
+        logger.debug(
+            "web provider %r %s availability check failed: %s",
+            backend,
+            capability,
+            exc,
+        )
+        return False
+
+
 def _list_registered_web_providers():
     """Return all plugin-registered web providers (empty list on failure)."""
     try:
@@ -984,30 +1006,31 @@ def check_web_api_key() -> bool:
     :func:`_is_backend_available`, which delegates non-legacy names to the
     registry.
     """
-    configured = _load_web_config().get("backend", "").lower().strip()
-    if configured and _is_backend_available(configured):
-        return True
+    configured = _configured_web_backend("search")
+    if configured:
+        # Explicit selection is authoritative. A different available backend
+        # must not turn a misconfigured selection green.
+        if configured not in _LEGACY_WEB_BACKENDS:
+            registered = _registered_web_capability_available(configured, "search")
+            return bool(registered)
+        return _is_backend_available(configured)
     # Any built-in backend with credentials present. This is a boolean OR, so
     # unlike _get_backend() the probe order is irrelevant.
     if any(_is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS):
         return True
-    # Any plugin-registered provider the registry considers active for either
-    # capability. Delegating to the registry's own availability-filtered
-    # resolvers keeps a single authority for "is a custom provider usable"
-    # rather than re-implementing the walk here.
-    try:
-        from agent.web_search_registry import (
-            get_active_search_provider,
-            get_active_extract_provider,
-        )
-
-        return (
-            get_active_search_provider() is not None
-            or get_active_extract_provider() is not None
-        )
-    except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
-        logger.debug("web provider registry availability check failed: %s", exc)
-        return False
+    # Legacy providers were already checked through their canonical probes
+    # above. Only consider genuinely plugin-contributed names here; otherwise
+    # the registry's independently imported DDGS/Firecrawl implementations can
+    # contradict those probes and turn diagnostics green incorrectly.
+    for provider in _list_registered_web_providers():
+        if provider.name in _LEGACY_WEB_BACKENDS:
+            continue
+        try:
+            if provider.supports_search() and provider.is_available():
+                return True
+        except Exception as exc:  # noqa: BLE001 — broken plugin is unavailable
+            logger.debug("web provider %r availability check failed: %s", provider.name, exc)
+    return False
 
 
 def check_web_extract_available() -> bool:
@@ -1017,6 +1040,9 @@ def check_web_extract_available() -> bool:
     make web_search usable, but they must not advertise native web_extract.
     """
     backend = _get_extract_backend()
+    if backend not in _LEGACY_WEB_BACKENDS:
+        registered = _registered_web_capability_available(backend, "extract")
+        return bool(registered)
     if backend in _SEARCH_ONLY_BACKENDS:
         return False
     return _is_backend_available(backend)

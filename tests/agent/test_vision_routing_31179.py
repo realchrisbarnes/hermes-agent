@@ -191,6 +191,68 @@ model:
         # Bogus provider/model — capability lookup returns None → permissive.
         assert _main_model_supports_vision("nonexistent-provider", "nonexistent-model") is True
 
+    def test_explicit_vision_override_wins_for_known_text_only_direct_route(
+        self, isolated_home, monkeypatch
+    ):
+        _write_config(isolated_home, """
+model:
+  provider: deepseek
+  default: deepseek-v4-pro
+  supports_vision: true
+""")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        _fresh_modules()
+
+        from agent.auxiliary_client import resolve_vision_provider_client
+        provider, client, _model = resolve_vision_provider_client(provider="auto")
+        assert provider == "deepseek"
+        assert client is not None
+
+    def test_aggregator_deepseek_slug_remains_attemptable(
+        self, isolated_home, monkeypatch
+    ):
+        _write_config(isolated_home, """
+model:
+  provider: openrouter
+  default: deepseek/unknown-multimodal-preview
+""")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        _fresh_modules()
+
+        from agent.auxiliary_client import resolve_vision_provider_client
+        provider, client, _model = resolve_vision_provider_client(provider="auto")
+        assert provider == "openrouter"
+        assert client is not None
+
+    def test_aggregator_definitive_text_only_capability_is_honored(
+        self, isolated_home
+    ):
+        _fresh_modules()
+        from agent.auxiliary_client import _main_model_supports_vision
+        from unittest.mock import patch
+
+        with patch(
+            "agent.image_routing._lookup_supports_vision", return_value=False
+        ):
+            assert _main_model_supports_vision(
+                "openrouter", "vendor/known-text-only"
+            ) is False
+
+    def test_custom_deepseek_named_route_is_not_rejected_by_slug(
+        self, isolated_home
+    ):
+        _write_config(isolated_home, """
+model:
+  provider: custom:deepseek-proxy
+  default: deepseek-v4-pro
+""")
+        _fresh_modules()
+
+        from agent.auxiliary_client import _main_model_supports_vision
+        assert _main_model_supports_vision(
+            "custom:deepseek-proxy", "deepseek-v4-pro"
+        ) is True
+
 
 # ---------------------------------------------------------------------------
 # Fix 3: check_vision_requirements + check_browser_vision_requirements parity

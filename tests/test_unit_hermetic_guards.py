@@ -25,6 +25,14 @@ def test_package_managers_are_denied(command):
         subprocess.Popen(command)
 
 
+def test_read_only_package_manager_version_probe_is_allowed():
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv not installed")
+    result = subprocess.run([uv, "--version"], check=True, capture_output=True, text=True)
+    assert result.stdout.startswith("uv ")
+
+
 @pytest.mark.live_system_guard_bypass
 def test_live_system_bypass_does_not_disable_package_guard():
     with pytest.raises(RuntimeError, match="package manager denied"):

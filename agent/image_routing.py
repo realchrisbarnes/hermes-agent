@@ -415,6 +415,56 @@ def _lookup_supports_vision(
     return None
 
 
+_DIRECT_PROVIDERS_WITHOUT_VISION = frozenset({
+    "deepseek",
+    "kimi-coding",
+    "kimi-coding-cn",
+})
+
+
+def _resolve_vision_capability(
+    provider: str,
+    model: str,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Optional[bool]:
+    """Resolve route-aware vision capability as True, False, or unknown.
+
+    Explicit operator metadata wins. Known direct text-only endpoints then
+    fail closed regardless of catalog data, because their transport contract
+    is narrower than the provider family's model metadata. Definite catalog
+    metadata is honored for all other routes, including aggregators. Only a
+    genuinely unknown aggregator or custom route remains attemptable.
+    """
+    normalized = (provider or "").strip().lower()
+    try:
+        from hermes_cli.models import normalize_provider
+
+        normalized = normalize_provider(normalized)
+    except Exception:
+        pass
+
+    override = _supports_vision_override(cfg, normalized, model)
+    if override is not None:
+        return override
+
+    if normalized in _DIRECT_PROVIDERS_WITHOUT_VISION:
+        return False
+
+    catalog = _lookup_supports_vision(normalized, model, cfg)
+    if catalog is not None:
+        return catalog
+
+    try:
+        from hermes_cli.providers import is_routing_aggregator
+
+        if is_routing_aggregator(normalized):
+            return None
+    except Exception:
+        pass
+
+    return None
+
+
 def decide_image_input_mode(
     provider: str,
     model: str,
@@ -442,7 +492,7 @@ def decide_image_input_mode(
     # explicit auxiliary.vision config acts as a *fallback* for text-only
     # main models — it should not preempt native vision on a model that
     # can natively inspect the pixels (issue #29135).
-    supports = _lookup_supports_vision(provider, model, cfg)
+    supports = _resolve_vision_capability(provider, model, cfg)
     if supports is True:
         return "native"
     if _explicit_aux_vision_override(cfg):

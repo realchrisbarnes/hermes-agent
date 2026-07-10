@@ -108,8 +108,12 @@ def test_opencode_go_totally_unknown_model_still_accepted():
 
 @_patched
 def test_opencode_zen_known_model_accepted():
-    """opencode-zen also uses _PROVIDER_MODELS; kimi-k2 is in its catalog."""
-    result = validate_requested_model("kimi-k2", "opencode-zen")
+    """Any currently registered Zen model is recognized without a live catalog."""
+    from hermes_cli.models import provider_model_ids
+
+    registered = provider_model_ids("opencode-zen")
+    assert registered, "opencode-zen must expose a nonempty fallback catalog"
+    result = validate_requested_model(registered[0], "opencode-zen")
     assert result["accepted"] is True
     assert result["recognized"] is True
 

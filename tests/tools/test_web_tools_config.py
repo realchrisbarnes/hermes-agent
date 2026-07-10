@@ -837,6 +837,30 @@ class TestNonBuiltinProviderAvailability:
             from tools.web_tools import check_web_api_key
             assert check_web_api_key() is True
 
+    def test_extract_only_plugin_does_not_advertise_web_search(self):
+        from agent.web_search_registry import _reset_for_tests, register_provider
+        from tools.web_tools import check_web_api_key, check_web_extract_available
+
+        _reset_for_tests()
+        register_provider(self._create_fake_provider(search=False, extract=True))
+        with patch("tools.web_tools._load_web_config", return_value={
+            "backend": "fake-plugin-prov",
+        }):
+            assert check_web_api_key() is False
+            assert check_web_extract_available() is True
+
+    def test_search_only_plugin_does_not_advertise_web_extract(self):
+        from agent.web_search_registry import _reset_for_tests, register_provider
+        from tools.web_tools import check_web_api_key, check_web_extract_available
+
+        _reset_for_tests()
+        register_provider(self._create_fake_provider(search=True, extract=False))
+        with patch("tools.web_tools._load_web_config", return_value={
+            "backend": "fake-plugin-prov",
+        }):
+            assert check_web_api_key() is True
+            assert check_web_extract_available() is False
+
     def test_get_backend_discovers_custom_provider(self):
         """_get_backend() must return the custom provider name when it's
         the only available provider."""

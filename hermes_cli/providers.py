@@ -478,6 +478,20 @@ def get_label(provider_id: str) -> str:
 
     # Try models.dev
     pdef = get_provider(canonical)
+    if pdef and pdef.name and pdef.name != canonical:
+        return pdef.name
+
+    # Provider profiles own display metadata for Hermes-native providers that
+    # models.dev omits or labels with the raw slug. Identity remains canonical.
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(canonical)
+        if profile and profile.display_name:
+            return profile.display_name
+    except Exception:
+        pass
+
     if pdef:
         return pdef.name
 

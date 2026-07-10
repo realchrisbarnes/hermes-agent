@@ -12,6 +12,7 @@ from agent.image_routing import (
     _coerce_mode,
     _explicit_aux_vision_override,
     _lookup_supports_vision,
+    _resolve_vision_capability,
     _supports_vision_override,
     build_native_content_parts,
     decide_image_input_mode,
@@ -112,6 +113,36 @@ class TestDecideImageInputMode:
         cfg = {"auxiliary": {"vision": {"provider": "openrouter", "model": "google/gemini-2.5-flash"}}}
         with patch("agent.image_routing._lookup_supports_vision", return_value=False):
             assert decide_image_input_mode("deepseek", "deepseek-v4-pro", cfg) == "text"
+
+    def test_direct_text_only_route_overrides_catalog_true(self):
+        with patch("agent.image_routing._lookup_supports_vision", return_value=True):
+            assert _resolve_vision_capability(
+                "kimi-coding", "future-kimi-model", {}
+            ) is False
+
+    def test_direct_text_only_aliases_fail_closed_when_catalog_unknown(self):
+        with patch("agent.image_routing._lookup_supports_vision", return_value=None):
+            assert _resolve_vision_capability(
+                "deep-seek", "future-deepseek-model", {}
+            ) is False
+            assert _resolve_vision_capability(
+                "moonshot", "future-kimi-model", {}
+            ) is False
+
+    def test_canonical_override_wins_for_aliased_direct_provider(self):
+        cfg = {
+            "model": {"provider": "deep-seek"},
+            "providers": {
+                "deepseek": {
+                    "models": {
+                        "future-deepseek-model": {"supports_vision": True},
+                    },
+                },
+            },
+        }
+        assert _resolve_vision_capability(
+            "deep-seek", "future-deepseek-model", cfg
+        ) is True
 
     def test_none_config_is_auto(self):
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):
