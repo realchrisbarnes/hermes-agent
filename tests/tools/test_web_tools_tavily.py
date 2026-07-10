@@ -61,6 +61,16 @@ class TestTavilyRequest:
                 with pytest.raises(_httpx.HTTPStatusError):
                     _tavily_request("search", {"query": "test"})
 
+    def test_timeout_is_not_retried_or_partially_normalized(self):
+        import httpx as _httpx
+
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
+             patch("tools.web_tools.httpx.post", side_effect=_httpx.TimeoutException("timeout")) as mock_post:
+            from tools.web_tools import _tavily_request
+            with pytest.raises(_httpx.TimeoutException):
+                _tavily_request("search", {"query": "test"})
+        mock_post.assert_called_once()
+
 
 # ─── _normalize_tavily_search_results ─────────────────────────────────────────
 
@@ -206,12 +216,17 @@ class TestWebExtractTavily:
         from agent.web_search_registry import _reset_for_tests
         _reset_for_tests()
 
-    def test_extract_dispatches_to_tavily(self):
+    def test_extract_dispatches_to_tavily(self, monkeypatch):
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "results": [{"url": "https://example.com", "raw_content": "Extracted content", "title": "Page"}]
         }
         mock_response.raise_for_status = MagicMock()
+
+        async def _safe_url(_url):
+            return True
+
+        monkeypatch.setattr("tools.web_tools.async_is_safe_url", _safe_url)
 
         with patch("tools.web_tools._get_backend", return_value="tavily"), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
@@ -225,3 +240,13 @@ class TestWebExtractTavily:
             assert result["results"][0]["url"] == "https://example.com"
             assert "Extracted content" in result["results"][0]["content"]
 
+    def test_resolution_rejection_never_starts_transport(self, monkeypatch):
+        async def _unsafe_url(_url):
+            return False
+
+        monkeypatch.setattr("tools.web_tools.async_is_safe_url", _unsafe_url)
+        with patch("tools.web_tools.httpx.post", side_effect=AssertionError("transport must not start")):
+            from tools.web_tools import web_extract_tool
+            result = json.loads(asyncio.run(web_extract_tool(["https://example.com"])))
+        assert result["results"][0]["content"] == ""
+        assert "private or internal" in result["results"][0]["error"]

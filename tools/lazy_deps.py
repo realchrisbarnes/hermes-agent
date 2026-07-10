@@ -54,8 +54,8 @@ Security model:
   whatever was installed at setup time.
 * **Offline detection.** If the install fails (offline, mirror down,
   PyPI 404 / quarantine), we surface the failure as
-  :class:`FeatureUnavailable` with the actual pip stderr — no silent
-  retries, no caching of bad state.
+  :class:`FeatureUnavailable` with the actual pip stderr and briefly memoize
+  noninteractive failures to prevent retry storms. Explicit setup can retry.
 
 Adding a new backend:
 
@@ -75,9 +75,22 @@ import site
 import subprocess
 import sys
 import sysconfig
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+try:  # POSIX cross-process install serialization.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows cross-process install serialization.
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +154,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.0.1",),
     "memory.hindsight": ("hindsight-client==0.6.1",),
+    # The embedded API was already exercised against the historical 0.4.22
+    # floor. Keep a tight pre-1.0 ceiling per the dependency policy.
+    "memory.hindsight_embedded": ("hindsight-all>=0.4.22,<0.7",),
     # supermemory + mem0 are opt-in cloud memory providers with their own
     # SDKs. On the published Docker image the agent venv is sealed
     # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
@@ -300,6 +316,70 @@ _LAZY_TARGET_ENV = "HERMES_LAZY_INSTALL_TARGET"
 # incompatible; we detect the mismatch and wipe the store so packages get
 # re-resolved against the new interpreter rather than importing a stale .so.
 _TARGET_STAMP_NAME = ".python-abi"
+
+# One installer per feature at a time. A short failure memo lets concurrent
+# waiters observe the same result without launching a retry storm, while a
+# later explicit attempt can recover after an offline mirror comes back.
+_ENSURE_LOCKS: dict[str, threading.Lock] = {}
+_ENSURE_LOCKS_GUARD = threading.Lock()
+_ENSURE_FAILURES: dict[str, tuple[tuple[str, ...], str, float, int]] = {}
+_ENSURE_FAILURE_TTL_SECONDS = 300.0
+_INSTALL_LOCKS: dict[str, threading.Lock] = {}
+_INSTALL_LOCKS_GUARD = threading.Lock()
+
+
+def _install_environment_key() -> str:
+    target = _lazy_install_target()
+    return (
+        f"target:{target.expanduser().resolve(strict=False)}"
+        if target is not None
+        else f"venv:{Path(sys.executable).resolve(strict=False)}"
+    )
+
+
+def _install_environment_lock() -> threading.Lock:
+    """Return the in-process lock for the environment being mutated."""
+    key = _install_environment_key()
+    with _INSTALL_LOCKS_GUARD:
+        return _INSTALL_LOCKS.setdefault(key, threading.Lock())
+
+
+def _install_lock_path() -> Path:
+    """Stable lock beside the active writable install destination."""
+    target = _lazy_install_target()
+    if target is not None:
+        resolved = target.expanduser().resolve(strict=False)
+        return resolved.parent / f".{resolved.name}.hermes-lazy-install.lock"
+    venv_root = Path(sys.executable).resolve(strict=False).parent.parent
+    return venv_root / ".hermes-lazy-install.lock"
+
+
+@contextmanager
+def _cross_process_install_lock():
+    """Serialize package mutations across Hermes processes on this host."""
+    path = _install_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a+b", buffering=0) as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return
+        if msvcrt is not None:  # pragma: no cover - Windows
+            if path.stat().st_size == 0:
+                handle.write(b"0")
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        yield  # pragma: no cover - unsupported platform
 
 
 def _python_abi_tag() -> str:
@@ -719,6 +799,40 @@ def feature_missing(feature: str) -> tuple[str, ...]:
 
 
 def ensure(feature: str, *, prompt: bool = True) -> None:
+    """Single-flight wrapper around the gated lazy-dependency installer."""
+    with _ENSURE_LOCKS_GUARD:
+        lock = _ENSURE_LOCKS.setdefault(feature, threading.Lock())
+    with lock:
+        missing = feature_missing(feature) if feature in LAZY_DEPS else ()
+        cached = _ENSURE_FAILURES.get(feature)
+        if (
+            not prompt
+            and cached
+            and cached[0] == missing
+            and cached[3] == id(_venv_pip_install)
+            and time.monotonic() < cached[2]
+        ):
+            raise FeatureUnavailable(feature, missing, cached[1])
+        if cached:
+            _ENSURE_FAILURES.pop(feature, None)
+        try:
+            _ensure_unlocked(feature, prompt=prompt, missing=missing)
+        except FeatureUnavailable as exc:
+            if exc.reason.startswith("pip install failed:") or exc.reason.startswith(
+                "install reported success but packages still not importable"
+            ):
+                _ENSURE_FAILURES[feature] = (
+                    exc.missing, exc.reason, time.monotonic() + _ENSURE_FAILURE_TTL_SECONDS,
+                    id(_venv_pip_install),
+                )
+            raise
+        else:
+            _ENSURE_FAILURES.pop(feature, None)
+
+
+def _ensure_unlocked(
+    feature: str, *, prompt: bool = True, missing: tuple[str, ...] | None = None,
+) -> None:
     """Make sure all packages for ``feature`` are importable.
 
     If they're missing, attempts to install them in the active venv. Raises
@@ -735,7 +849,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             feature, (), f"feature {feature!r} not in LAZY_DEPS allowlist"
         )
 
-    missing = feature_missing(feature)
+    missing = feature_missing(feature) if missing is None else missing
     if not missing:
         return
 
@@ -784,8 +898,16 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
                 feature, missing, "user declined install at prompt"
             )
 
-    logger.info("Lazy-installing %s for feature %r", " ".join(missing), feature)
-    result = _venv_pip_install(missing)
+    # uv and pip both mutate shared environment metadata. Different optional
+    # features may be requested concurrently, so serialize only the installer
+    # section per destination while retaining per-feature single-flight above.
+    with _install_environment_lock(), _cross_process_install_lock():
+        # Another process may have satisfied this feature while we waited.
+        missing = feature_missing(feature)
+        if not missing:
+            return
+        logger.info("Lazy-installing %s for feature %r", " ".join(missing), feature)
+        result = _venv_pip_install(missing)
     if not result.success:
         # Surface the actual pip error so the user can debug PyPI-side
         # issues (404 quarantine, network down, etc.).

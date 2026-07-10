@@ -217,8 +217,9 @@ class TestSealedVenvDurableTarget:
             "the path honcho/hindsight use on hosted Fly instances"
         )
 
-        # Drive ensure(): missing first, satisfied after the (stubbed) install.
-        states = iter([False, True])
+        # Drive ensure(): missing before and after the cross-process lock,
+        # satisfied only after the (stubbed) install.
+        states = iter([False, False, True])
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: next(states))
 
         captured = {}

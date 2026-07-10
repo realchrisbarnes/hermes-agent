@@ -91,6 +91,9 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
     )
+    # URL policy is a separate unit: inject its positive decision so attachment
+    # tests exercise the transport without public DNS.
+    monkeypatch.setattr(discord_platform, "is_safe_url", lambda _url: True)
 
 
 @pytest.fixture
@@ -299,6 +302,19 @@ class TestIncomingDocumentHandling:
         adapter.handle_message.assert_called_once()
         event = adapter.handle_message.call_args[0][0]
         assert event.media_urls == []
+
+    @pytest.mark.asyncio
+    async def test_resolution_failure_has_no_partial_document_state(self, adapter, monkeypatch):
+        monkeypatch.setattr(discord_platform, "is_safe_url", lambda _url: False)
+        with patch("aiohttp.ClientSession", side_effect=AssertionError("transport must not start")):
+            msg = make_message([
+                make_attachment(filename="report.pdf", content_type="application/pdf")
+            ])
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == []
+        assert event.media_types == []
 
     @pytest.mark.asyncio
     async def test_large_txt_cached_not_injected(self, adapter):
@@ -510,4 +526,3 @@ class TestAllowAnyAttachment:
         """Garbage in max_attachment_bytes config falls back to 32 MiB."""
         adapter.config.extra["max_attachment_bytes"] = "not-a-number"
         assert adapter._discord_max_attachment_bytes() == 32 * 1024 * 1024
-

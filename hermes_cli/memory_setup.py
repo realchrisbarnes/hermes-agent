@@ -233,7 +233,8 @@ def cmd_setup_provider(provider_name: str) -> None:
 
     _clear_interactive_transition()
 
-    _install_dependencies(name)
+    if not getattr(provider, "manages_dependencies", False):
+        _install_dependencies(name)
 
     config = load_config()
     if not isinstance(config.get("memory"), dict):
@@ -291,7 +292,8 @@ def cmd_setup(args) -> None:
     _clear_interactive_transition()
 
     # Install pip dependencies if declared in plugin.yaml
-    _install_dependencies(name)
+    if not getattr(provider, "manages_dependencies", False):
+        _install_dependencies(name)
 
     # If the provider has a post_setup hook, delegate entirely to it.
     # The hook handles its own config, connection test, and activation.

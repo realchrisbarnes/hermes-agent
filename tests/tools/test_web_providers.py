@@ -365,6 +365,11 @@ class TestDispatchersTriggerPluginDiscovery:
         from agent import web_search_registry
         from tools import web_tools
 
+        async def _safe_url(_url):
+            return True
+
+        monkeypatch.setattr(web_tools, "async_is_safe_url", _safe_url)
+
         restore = self._clear_registry()
         try:
             class FakeFirecrawl(WebSearchProvider):
@@ -491,4 +496,3 @@ class TestDispatchersTriggerPluginDiscovery:
             assert web_search_registry.get_provider("brave-free") is not None
         finally:
             restore()
-

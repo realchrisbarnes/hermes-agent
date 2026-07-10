@@ -12,6 +12,11 @@ call is mocked — we never actually shell out during unit tests.
 
 from __future__ import annotations
 
+import concurrent.futures
+import subprocess
+import sys
+import threading
+import time
 
 import pytest
 
@@ -206,6 +211,149 @@ class TestEnsure:
         with pytest.raises(ld.FeatureUnavailable, match="still not importable"):
             ld.ensure("test.cache", prompt=False)
 
+    @pytest.mark.parametrize("install_succeeds", [True, False])
+    def test_concurrent_first_use_runs_one_installer(self, monkeypatch, install_succeeds):
+        feature = f"test.concurrent.{install_succeeds}"
+        monkeypatch.setitem(ld.LAZY_DEPS, feature, ("zzzfake>=1",))
+        installed = threading.Event()
+        calls = []
+        lock = threading.Lock()
+
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: installed.is_set())
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+
+        def fake_install(specs, **kwargs):
+            with lock:
+                calls.append(specs)
+            time.sleep(0.05)
+            if install_succeeds:
+                installed.set()
+                return ld._InstallResult(True, "ok", "")
+            return ld._InstallResult(False, "", "offline")
+
+        monkeypatch.setattr(ld, "_venv_pip_install", fake_install)
+
+        def invoke():
+            try:
+                ld.ensure(feature, prompt=False)
+                return "ok"
+            except ld.FeatureUnavailable as exc:
+                return exc.reason
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _n: invoke(), range(4)))
+
+        assert len(calls) == 1
+        if install_succeeds:
+            assert results == ["ok"] * 4
+        else:
+            assert results == ["pip install failed: offline"] * 4
+
+    def test_noninteractive_failure_is_backed_off_but_explicit_setup_retries(
+        self, monkeypatch
+    ):
+        feature = "test.retry.backoff"
+        monkeypatch.setitem(ld.LAZY_DEPS, feature, ("zzzfake>=1",))
+        installed = False
+        calls = []
+
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: installed)
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+
+        def fake_install(specs, **kwargs):
+            nonlocal installed
+            calls.append(specs)
+            if len(calls) == 1:
+                return ld._InstallResult(False, "", "offline")
+            installed = True
+            return ld._InstallResult(True, "ok", "")
+
+        monkeypatch.setattr(ld, "_venv_pip_install", fake_install)
+
+        with pytest.raises(ld.FeatureUnavailable, match="offline"):
+            ld.ensure(feature, prompt=False)
+        with pytest.raises(ld.FeatureUnavailable, match="offline"):
+            ld.ensure(feature, prompt=False)
+        assert len(calls) == 1
+
+        # Explicit setup is an operator-initiated retry and bypasses the
+        # noninteractive failure backoff.
+        ld.ensure(feature, prompt=True)
+        assert len(calls) == 2
+
+    def test_distinct_features_serialize_installs_into_same_environment(
+        self, monkeypatch
+    ):
+        features = ("test.install.one", "test.install.two")
+        for feature in features:
+            monkeypatch.setitem(ld.LAZY_DEPS, feature, (f"{feature}>=1",))
+
+        installed = set()
+        active = 0
+        max_active = 0
+        guard = threading.Lock()
+
+        monkeypatch.setattr(
+            ld,
+            "_is_satisfied",
+            lambda spec: spec.split(">=", 1)[0] in installed,
+        )
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+
+        def fake_install(specs, **kwargs):
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            installed.add(specs[0].split(">=", 1)[0])
+            with guard:
+                active -= 1
+            return ld._InstallResult(True, "ok", "")
+
+        monkeypatch.setattr(ld, "_venv_pip_install", fake_install)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda feature: ld.ensure(feature, prompt=False), features))
+
+        assert max_active == 1
+
+    @pytest.mark.skipif(ld.fcntl is None, reason="POSIX flock required")
+    def test_cross_process_install_lock_excludes_child(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(tmp_path / "lazy-target"))
+        lock_path = ld._install_lock_path()
+        code = f"""
+import fcntl
+from pathlib import Path
+p = Path({str(lock_path)!r})
+with p.open('a+b') as handle:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print('blocked')
+    else:
+        print('acquired')
+"""
+        with ld._cross_process_install_lock():
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        assert result.stdout.strip() == "blocked"
+
+    def test_cross_process_lock_creates_missing_target_parent(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "missing-parent" / "lazy-target"
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+
+        with ld._cross_process_install_lock():
+            assert ld._install_lock_path().exists()
+
+        assert target.parent.is_dir()
+
 
 # ---------------------------------------------------------------------------
 # is_available
@@ -347,9 +495,9 @@ class TestRefreshActiveFeatures:
     def test_stale_pin_triggers_reinstall(self, monkeypatch):
         monkeypatch.setattr(ld, "active_features", lambda: ["test.feat"])
         monkeypatch.setitem(ld.LAZY_DEPS, "test.feat", ("zzzfake==2.0.0",))
-        # First _is_satisfied check (in feature_missing) says no; after
-        # install, post-install check says yes.
-        states = iter([False, True])
+        # refresh_active_features plus ensure's pre-lock and in-lock rechecks
+        # all report stale; only the post-install check reports current.
+        states = iter([False, False, False, True])
         monkeypatch.setattr(ld, "_is_satisfied", lambda spec: next(states))
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
         monkeypatch.setattr(

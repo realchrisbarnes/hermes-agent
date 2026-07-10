@@ -22,6 +22,7 @@ Lifecycle (called by MemoryManager, wired in run_agent.py):
   shutdown()             — clean exit
 
 Optional hooks (override to opt in):
+  manages_dependencies = True             — post_setup owns dependency selection/install
   on_turn_start(turn, message, **kwargs) — per-turn tick with runtime context
   on_session_end(messages)               — end-of-session extraction
   on_session_switch(new_session_id, **kwargs) — mid-process session_id rotation
@@ -42,6 +43,11 @@ logger = logging.getLogger(__name__)
 
 class MemoryProvider(ABC):
     """Abstract base class for memory providers."""
+
+    # Providers with mode-specific dependency sets can own dependency setup in
+    # post_setup(). The CLI skips its legacy manifest installer only when this
+    # explicit contract is overridden.
+    manages_dependencies = False
 
     @property
     @abstractmethod

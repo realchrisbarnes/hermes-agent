@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 import hermes_cli.memory_setup as memory_setup
+from agent.memory_provider import MemoryProvider
 from hermes_cli.memory_setup import _CANCELLED, _curses_select
 
 
@@ -28,6 +31,10 @@ def test_curses_select_cancel_defaults_to_selected(monkeypatch):
         "selected": 1,
         "cancel_returns": 1,
     }
+
+
+def test_memory_provider_dependency_contract_defaults_to_cli_managed():
+    assert MemoryProvider.manages_dependencies is False
 
 
 def test_curses_select_accepts_explicit_cancel_value(monkeypatch):
@@ -127,6 +134,68 @@ def test_cmd_setup_provider_clears_before_provider_post_setup(monkeypatch):
     memory_setup.cmd_setup_provider("openviking")
 
     assert events == ["clear", "install", "post_setup"]
+
+
+def test_cmd_setup_skips_generic_installer_for_provider_managed_dependencies(
+    monkeypatch
+):
+    events = []
+
+    class ManagedDependencyProvider:
+        manages_dependencies = True
+
+        def post_setup(self, hermes_home, config):
+            events.append("post_setup")
+
+    provider = ManagedDependencyProvider()
+    monkeypatch.setattr(
+        memory_setup,
+        "_get_available_providers",
+        lambda: [("hindsight", "local/cloud", provider)],
+    )
+    monkeypatch.setattr(memory_setup, "_curses_select", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(memory_setup, "_clear_interactive_transition", lambda: None)
+    monkeypatch.setattr(
+        memory_setup,
+        "_install_dependencies",
+        lambda name: pytest.fail("generic installer must not run before mode selection"),
+    )
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: "/tmp/hermes-test")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"memory": {}})
+
+    memory_setup.cmd_setup(SimpleNamespace())
+
+    assert events == ["post_setup"]
+
+
+def test_cmd_setup_provider_skips_generic_installer_for_managed_dependencies(
+    monkeypatch
+):
+    events = []
+
+    class ManagedDependencyProvider:
+        manages_dependencies = True
+
+        def post_setup(self, hermes_home, config):
+            events.append("post_setup")
+
+    monkeypatch.setattr(
+        memory_setup,
+        "_get_available_providers",
+        lambda: [("hindsight", "local/cloud", ManagedDependencyProvider())],
+    )
+    monkeypatch.setattr(memory_setup, "_clear_interactive_transition", lambda: None)
+    monkeypatch.setattr(
+        memory_setup,
+        "_install_dependencies",
+        lambda name: pytest.fail("generic installer must not run before mode selection"),
+    )
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: "/tmp/hermes-test")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"memory": {}})
+
+    memory_setup.cmd_setup_provider("hindsight")
+
+    assert events == ["post_setup"]
 
 
 def test_cmd_status_prefers_provider_status_config(monkeypatch, capsys):

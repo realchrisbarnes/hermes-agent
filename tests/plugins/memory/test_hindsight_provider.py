@@ -143,6 +143,79 @@ def _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, mod
     }
 
 
+def test_constructor_and_initialize_never_install(tmp_path, monkeypatch):
+    """Object/config initialization is side-effect free even with a stale SDK."""
+    import importlib.metadata
+
+    package_manager_calls = []
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.1.0")
+    monkeypatch.setattr("shutil.which", lambda name: f"/fixture/{name}")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda command, **kwargs: package_manager_calls.append(command),
+    )
+    monkeypatch.setattr(
+        "plugins.memory.hindsight._load_config",
+        lambda: {"mode": "cloud", "apiKey": "fixture", "banks": {"hermes": {}}},
+    )
+
+    provider = HindsightMemoryProvider()
+    provider.initialize("session", hermes_home=str(tmp_path), platform="cli")
+
+    assert package_manager_calls == []
+
+
+def test_embedded_first_use_ensures_before_runtime_import(monkeypatch):
+    calls = []
+
+    def fake_ensure(feature, prompt=True):
+        calls.append((feature, prompt))
+
+    def fake_runtime_check():
+        assert calls == [("memory.hindsight_embedded", False)]
+        return True, None
+
+    class FakeHindsightEmbedded:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("tools.lazy_deps.ensure", fake_ensure)
+    monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", fake_runtime_check)
+    monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
+
+    provider = HindsightMemoryProvider()
+    provider._mode = "local_embedded"
+    provider._config = {"profile": "hermes", "llm_provider": "openai", "llm_model": "fixture"}
+
+    assert isinstance(provider._get_client(), FakeHindsightEmbedded)
+    assert calls == [("memory.hindsight_embedded", False)]
+
+
+def test_embedded_initialize_does_not_start_daemon_when_dependency_is_missing(
+    tmp_path, monkeypatch
+):
+    """Session initialization must not turn a missing optional dep into install work."""
+    monkeypatch.setattr(
+        "plugins.memory.hindsight._load_config",
+        lambda: {"mode": "local_embedded", "banks": {"hermes": {}}},
+    )
+    monkeypatch.setattr(
+        "tools.lazy_deps.feature_missing",
+        lambda feature: ("hindsight-all>=0.4.22,<0.7",),
+    )
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.threading.Thread",
+        lambda *args, **kwargs: pytest.fail(
+            "initialize must not spawn dependency acquisition in a background thread"
+        ),
+    )
+
+    provider = HindsightMemoryProvider()
+    provider.initialize("session", hermes_home=str(tmp_path), platform="cli")
+
+    assert provider._mode == "local_embedded"
+
+
 class _FakeSessionDB:
     def __init__(self, messages=None):
         self._messages = list(messages or [])
@@ -425,6 +498,7 @@ class TestConfig:
                 captured.update(kwargs)
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda feature, prompt=False: None)
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
 
         p = HindsightMemoryProvider()
@@ -445,6 +519,26 @@ class TestConfig:
 
 
 class TestPostSetup:
+    @pytest.fixture(autouse=True)
+    def _stub_dependency_gate(self, monkeypatch):
+        self.dependency_calls = []
+        monkeypatch.setattr(
+            "tools.lazy_deps.ensure",
+            lambda feature, prompt=True: self.dependency_calls.append((feature, prompt)),
+        )
+
+    def test_cloud_setup_uses_shared_dependency_gate(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: 0)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("hermes_cli.secret_prompt.masked_secret_prompt", lambda _prompt: "fixture-key")
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda _cfg: None)
+
+        HindsightMemoryProvider().post_setup(str(hermes_home), {"memory": {}})
+
+        assert self.dependency_calls == [("memory.hindsight", True)]
+
     def test_setup_cancel_at_mode_picker_writes_nothing(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"
@@ -518,6 +612,7 @@ class TestPostSetup:
         provider = HindsightMemoryProvider()
         provider.post_setup(str(hermes_home), {"memory": {}})
 
+        assert self.dependency_calls == [("memory.hindsight_embedded", True)]
         assert saved_configs[-1]["memory"]["provider"] == "hindsight"
         env_text = (hermes_home / ".env").read_text()
         assert "HINDSIGHT_LLM_API_KEY=sk-local-test\n" in env_text
@@ -1681,7 +1776,7 @@ class TestAvailability:
 
         assert p.is_available()
 
-    def test_local_mode_unavailable_when_runtime_import_fails(self, tmp_path, monkeypatch):
+    def test_local_mode_remains_selectable_until_gated_first_use(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "plugins.memory.hindsight.get_hermes_home",
             lambda: tmp_path / "nonexistent",
@@ -1698,9 +1793,9 @@ class TestAvailability:
             _raise,
         )
         p = HindsightMemoryProvider()
-        assert not p.is_available()
+        assert p.is_available()
 
-    def test_initialize_disables_local_mode_when_runtime_import_fails(self, tmp_path, monkeypatch):
+    def test_initialize_does_not_import_or_disable_local_mode(self, tmp_path, monkeypatch):
         config = {"mode": "local_embedded"}
         config_path = tmp_path / "hindsight" / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1719,7 +1814,7 @@ class TestAvailability:
 
         p = HindsightMemoryProvider()
         p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
-        assert p._mode == "disabled"
+        assert p._mode == "local_embedded"
 
 
 class TestSharedEventLoopLifecycle:

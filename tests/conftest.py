@@ -20,7 +20,10 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import ipaddress
 import os
+import shlex
+import socket
 import sys
 from pathlib import Path
 
@@ -404,6 +407,74 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
 
 
+def _loopback_host(host) -> bool:
+    if host in (None, ""):
+        return True
+    if isinstance(host, bytes):
+        host = host.decode("ascii", errors="ignore")
+    text = str(host).strip().strip("[]")
+    if text == "localhost" or text.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
+def _package_manager_command(args) -> bool:
+    if isinstance(args, (str, bytes)):
+        text = args.decode(errors="replace") if isinstance(args, bytes) else args
+        try:
+            tokens = shlex.split(text)
+        except ValueError:
+            tokens = text.split()
+    else:
+        tokens = [str(value) for value in (args or [])]
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name.lower()
+    if executable in {"bash", "sh", "zsh"}:
+        for index, token in enumerate(tokens[:-1]):
+            if token in {"-c", "-lc"}:
+                return _package_manager_command(tokens[index + 1])
+        return False
+    if executable in {"env", "sudo", "command", "nohup"}:
+        remaining = tokens[1:]
+        options_with_values = {
+            "env": {
+                "-u", "--unset", "-C", "--chdir", "-P", "-S", "--split-string",
+            },
+            "sudo": {
+                "-u", "--user", "-g", "--group", "-h", "--host",
+                "-p", "--prompt", "-C", "--close-from", "-R", "--chroot",
+                "-D", "--chdir", "-T", "--command-timeout",
+            },
+        }.get(executable, set())
+        while remaining:
+            token = remaining[0]
+            if token == "--":
+                remaining.pop(0)
+                break
+            if executable == "env" and "=" in token and not token.startswith("-"):
+                remaining.pop(0)
+                continue
+            if token in options_with_values:
+                remaining = remaining[2:]
+                continue
+            if token.startswith("-"):
+                remaining.pop(0)
+                continue
+            break
+        return _package_manager_command(remaining)
+    if executable in {"pip", "pip3", "pipx", "poetry", "pdm", "uv"}:
+        return True
+    return (
+        len(tokens) > 2
+        and tokens[1] == "-m"
+        and tokens[2] in {"pip", "ensurepip", "pipx", "uv"}
+    )
+
+
 # Backward-compat alias — old tests reference this fixture name. Keep it
 # as a no-op wrapper so imports don't break.
 @pytest.fixture(autouse=True)
@@ -555,7 +626,171 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
 
 
 @pytest.fixture(autouse=True)
-def _live_system_guard(request, monkeypatch):
+def _unit_external_effect_guard(request, monkeypatch):
+    """Deny package mutation and public network access in the unit lane."""
+    if request.node.get_closest_marker("integration"):
+        yield
+        return
+
+    import asyncio as _asyncio
+    import os as _os
+    import subprocess as _subprocess
+
+    def _check_package_manager(name, cmd):
+        if _package_manager_command(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py unit hermeticity guard: package manager "
+                f"denied in {name}({cmd!r})"
+            )
+
+    def _wrap_subprocess(name, real):
+        def _guarded(cmd, *args, **kwargs):
+            _check_package_manager(f"subprocess.{name}", cmd)
+            return real(cmd, *args, **kwargs)
+        _guarded.__name__ = f"_unit_guarded_{name}"
+        if hasattr(real, "__class_getitem__"):
+            _guarded.__class_getitem__ = real.__class_getitem__
+        return _guarded
+
+    real_popen = _subprocess.Popen
+
+    class _UnitGuardedPopen(real_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, cmd, *args, **kwargs):
+            _check_package_manager("subprocess.Popen", cmd)
+            super().__init__(cmd, *args, **kwargs)
+
+    _UnitGuardedPopen.__name__ = "Popen"
+    _UnitGuardedPopen.__qualname__ = "Popen"
+    monkeypatch.setattr(_subprocess, "Popen", _UnitGuardedPopen)
+    for name in (
+        "run", "call", "check_call", "check_output", "getoutput", "getstatusoutput"
+    ):
+        monkeypatch.setattr(
+            _subprocess, name, _wrap_subprocess(name, getattr(_subprocess, name))
+        )
+
+    real_os_system = _os.system
+    real_os_popen = _os.popen
+
+    def _guarded_os_system(command):
+        _check_package_manager("os.system", command)
+        return real_os_system(command)
+
+    def _guarded_os_popen(command, *args, **kwargs):
+        _check_package_manager("os.popen", command)
+        return real_os_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(_os, "system", _guarded_os_system)
+    monkeypatch.setattr(_os, "popen", _guarded_os_popen)
+
+    real_async_exec = _asyncio.create_subprocess_exec
+    real_async_shell = _asyncio.create_subprocess_shell
+
+    async def _guarded_async_exec(program, *args, **kwargs):
+        _check_package_manager(
+            "asyncio.create_subprocess_exec", [program, *args]
+        )
+        return await real_async_exec(program, *args, **kwargs)
+
+    async def _guarded_async_shell(command, *args, **kwargs):
+        _check_package_manager("asyncio.create_subprocess_shell", command)
+        return await real_async_shell(command, *args, **kwargs)
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
+    monkeypatch.setattr(_asyncio, "create_subprocess_shell", _guarded_async_shell)
+
+    if os.environ.get("HERMES_RUN_NETWORK_TESTS") != "1":
+        real_getaddrinfo = socket.getaddrinfo
+        real_gethostbyname = socket.gethostbyname
+        real_gethostbyname_ex = socket.gethostbyname_ex
+        real_gethostbyaddr = socket.gethostbyaddr
+        real_getnameinfo = socket.getnameinfo
+        real_create_connection = socket.create_connection
+        real_connect = socket.socket.connect
+        real_connect_ex = socket.socket.connect_ex
+        real_sendto = socket.socket.sendto
+        real_sendmsg = getattr(socket.socket, "sendmsg", None)
+
+        def _deny_public_host(host, operation, error_type=OSError):
+            if not _loopback_host(host):
+                raise error_type(f"non-loopback {operation} denied in unit test: {host!r}")
+
+        def guarded_getaddrinfo(host, *args, **kwargs):
+            _deny_public_host(host, "DNS", socket.gaierror)
+            return real_getaddrinfo(host, *args, **kwargs)
+
+        def guarded_gethostbyname(host):
+            _deny_public_host(host, "DNS", socket.gaierror)
+            return real_gethostbyname(host)
+
+        def guarded_gethostbyname_ex(host):
+            _deny_public_host(host, "DNS", socket.gaierror)
+            return real_gethostbyname_ex(host)
+
+        def guarded_gethostbyaddr(host):
+            _deny_public_host(host, "DNS", socket.herror)
+            return real_gethostbyaddr(host)
+
+        def guarded_getnameinfo(sockaddr, *args, **kwargs):
+            host = sockaddr[0] if isinstance(sockaddr, tuple) and sockaddr else sockaddr
+            _deny_public_host(host, "DNS", socket.gaierror)
+            return real_getnameinfo(sockaddr, *args, **kwargs)
+
+        def guarded_create_connection(address, *args, **kwargs):
+            host = address[0] if isinstance(address, tuple) and address else address
+            _deny_public_host(host, "connection")
+            return real_create_connection(address, *args, **kwargs)
+
+        def _socket_host(sock, address):
+            if sock.family == socket.AF_UNIX:
+                return None
+            return address[0] if isinstance(address, tuple) and address else address
+
+        def guarded_connect(sock, address):
+            host = _socket_host(sock, address)
+            if host is not None:
+                _deny_public_host(host, "connection")
+            return real_connect(sock, address)
+
+        def guarded_connect_ex(sock, address):
+            host = _socket_host(sock, address)
+            if host is not None:
+                _deny_public_host(host, "connection")
+            return real_connect_ex(sock, address)
+
+        def guarded_sendto(sock, data, *args, **kwargs):
+            address = kwargs.get("address") or (args[-1] if args else None)
+            host = _socket_host(sock, address)
+            if host is not None:
+                _deny_public_host(host, "connection")
+            return real_sendto(sock, data, *args, **kwargs)
+
+        monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
+        monkeypatch.setattr(socket, "gethostbyname", guarded_gethostbyname)
+        monkeypatch.setattr(socket, "gethostbyname_ex", guarded_gethostbyname_ex)
+        monkeypatch.setattr(socket, "gethostbyaddr", guarded_gethostbyaddr)
+        monkeypatch.setattr(socket, "getnameinfo", guarded_getnameinfo)
+        monkeypatch.setattr(socket, "create_connection", guarded_create_connection)
+        monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+        monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+        monkeypatch.setattr(socket.socket, "sendto", guarded_sendto)
+
+        if real_sendmsg is not None:
+            def guarded_sendmsg(sock, buffers, ancdata=(), flags=0, address=None):
+                if address is not None:
+                    host = _socket_host(sock, address)
+                    if host is not None:
+                        _deny_public_host(host, "connection")
+                    return real_sendmsg(sock, buffers, ancdata, flags, address)
+                return real_sendmsg(sock, buffers, ancdata, flags)
+
+            monkeypatch.setattr(socket.socket, "sendmsg", guarded_sendmsg)
+
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _live_system_guard(request, monkeypatch, _unit_external_effect_guard):
     """Block real os.kill / systemctl / gateway-pid scans during tests.
 
     See block comment above for the why. Tests that genuinely need

@@ -52,8 +52,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
-# Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
@@ -140,13 +138,11 @@ def _check_local_runtime() -> tuple[bool, str | None]:
         return False, str(exc)
 
 
-def _ensure_cloud_client_dependency() -> None:
-    """Install the Hindsight cloud client lazily before importing it."""
+def _ensure_dependency(feature: str) -> None:
+    """Route optional Hindsight dependencies through the shared gate."""
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("memory.hindsight", prompt=False)
-    except ImportError:
-        pass
+        _lazy_ensure(feature, prompt=False)
     except Exception as exc:
         raise ImportError(str(exc)) from exc
 
@@ -621,6 +617,8 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
 class HindsightMemoryProvider(MemoryProvider):
     """Hindsight long-term memory with knowledge graph and multi-strategy retrieval."""
 
+    manages_dependencies = True
+
     def backup_paths(self) -> List[str]:
         """Hindsight's legacy shared config and embedded-mode profile env
         files live under ~/.hindsight (see _load_config / line ~509)."""
@@ -721,10 +719,7 @@ class HindsightMemoryProvider(MemoryProvider):
         try:
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
-            if mode in {"local", "local_embedded"}:
-                available, _ = _check_local_runtime()
-                return available
-            if mode == "local_external":
+            if mode in {"local", "local_embedded", "local_external"}:
                 return True
             has_key = bool(
                 cfg.get("apiKey")
@@ -755,8 +750,6 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
         """Custom setup wizard — installs only the deps needed for the selected mode."""
-        import subprocess
-        import shutil
         import sys
         from pathlib import Path
 
@@ -790,15 +783,12 @@ class HindsightMemoryProvider(MemoryProvider):
         provider_config["mode"] = mode
         env_writes: dict = {}
 
-        # Step 2: Install/upgrade deps for selected mode
-        cloud_dep = f"hindsight-client>={_MIN_CLIENT_VERSION}"
-        local_dep = "hindsight-all"
-        if mode == "local_embedded":
-            deps_to_install = [local_dep]
-        elif mode == "local_external":
-            deps_to_install = [cloud_dep]
-        else:
-            deps_to_install = [cloud_dep]
+        # Step 2: select the shared, allowlisted dependency gate. Installation
+        # happens only after the operator has chosen a mode.
+        dependency_feature = (
+            "memory.hindsight_embedded" if mode == "local_embedded"
+            else "memory.hindsight"
+        )
 
         llm_provider = ""
         if mode == "local_embedded":
@@ -822,21 +812,12 @@ class HindsightMemoryProvider(MemoryProvider):
             provider_config["llm_provider"] = llm_provider
 
         print("\n  Checking dependencies...")
-        uv_path = shutil.which("uv")
-        if not uv_path:
-            print("  ⚠ uv not found — install it: curl -LsSf https://astral.sh/uv/install.sh | sh")
-            print(f"  Then run manually: uv pip install --python {sys.executable} {' '.join(deps_to_install)}")
-        else:
-            try:
-                subprocess.run(
-                    [uv_path, "pip", "install", "--python", sys.executable, "--quiet", "--upgrade"] + deps_to_install,
-                    check=True, timeout=120, capture_output=True,
-                    stdin=subprocess.DEVNULL,
-                )
-                print("  ✓ Dependencies up to date")
-            except Exception as e:
-                print(f"  ⚠ Install failed: {e}")
-                print(f"  Run manually: uv pip install --python {sys.executable} {' '.join(deps_to_install)}")
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure(dependency_feature, prompt=True)
+            print("  ✓ Dependencies up to date")
+        except Exception as exc:
+            print(f"  ⚠ Dependency unavailable: {exc}")
 
         # Step 3: Mode-specific config
         if mode == "cloud":
@@ -1013,19 +994,13 @@ class HindsightMemoryProvider(MemoryProvider):
         """Return the cached Hindsight client (created once, reused)."""
         if self._client is None:
             if self._mode == "local_embedded":
+                _ensure_dependency("memory.hindsight_embedded")
                 available, reason = _check_local_runtime()
                 if not available:
                     raise RuntimeError(
                         "Hindsight local runtime is unavailable"
                         + (f": {reason}" if reason else "")
                     )
-                try:
-                    from tools.lazy_deps import ensure as _lazy_ensure
-                    _lazy_ensure("memory.hindsight", prompt=False)
-                except ImportError:
-                    pass
-                except Exception as _e:
-                    raise ImportError(str(_e))
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
@@ -1051,7 +1026,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 kwargs["idle_timeout"] = idle_timeout
                 self._client = HindsightEmbedded(**kwargs)
             else:
-                _ensure_cloud_client_dependency()
+                _ensure_dependency("memory.hindsight")
                 from hindsight_client import Hindsight
                 timeout = self._timeout or _DEFAULT_TIMEOUT
                 kwargs = {"base_url": self._api_url, "timeout": float(timeout)}
@@ -1211,35 +1186,6 @@ class HindsightMemoryProvider(MemoryProvider):
         start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._document_id = f"{self._session_id}-{start_ts}"
 
-        # Check client version and auto-upgrade if needed
-        try:
-            from importlib.metadata import version as pkg_version
-            from packaging.version import Version
-            installed = pkg_version("hindsight-client")
-            if Version(installed) < Version(_MIN_CLIENT_VERSION):
-                logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
-                               installed, _MIN_CLIENT_VERSION)
-                import shutil
-                import subprocess
-                import sys
-                uv_path = shutil.which("uv")
-                if uv_path:
-                    try:
-                        subprocess.run(
-                            [uv_path, "pip", "install", "--python", sys.executable,
-                             "--quiet", "--upgrade", f"hindsight-client>={_MIN_CLIENT_VERSION}"],
-                            check=True, timeout=120, capture_output=True,
-                            stdin=subprocess.DEVNULL,
-                        )
-                        logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-                    except Exception as e:
-                        logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                       e, _MIN_CLIENT_VERSION)
-                else:
-                    logger.warning("uv not found. Run: pip install 'hindsight-client>=%s'", _MIN_CLIENT_VERSION)
-        except Exception:
-            pass  # packaging not available or other issue — proceed anyway
-
         self._config = _load_config()
         self._platform = str(kwargs.get("platform") or "").strip()
         self._user_id = str(kwargs.get("user_id") or "").strip()
@@ -1270,14 +1216,6 @@ class HindsightMemoryProvider(MemoryProvider):
             # Export the daemon health grace timeout BEFORE importing
             # daemon_embed_manager (which reads it at import time).
             _export_port_health_grace_timeout(self._config)
-            available, reason = _check_local_runtime()
-            if not available:
-                logger.warning(
-                    "Hindsight local mode disabled because its runtime could not be imported: %s",
-                    reason,
-                )
-                self._mode = "disabled"
-                return
         self._api_key = self._config.get("apiKey") or self._config.get("api_key") or os.environ.get("HINDSIGHT_API_KEY", "")
         default_url = _DEFAULT_LOCAL_URL if self._mode in {"local_embedded", "local_external"} else _DEFAULT_API_URL
         self._api_url = self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url)
@@ -1399,20 +1337,33 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._mode = "disabled"
                 return
 
+            # Initialization is side-effect free: if the optional embedded
+            # distribution is absent, first client use acquires it through the
+            # shared allowlisted gate. Do not hide that install in this startup
+            # thread.
+            try:
+                from tools.lazy_deps import feature_missing
+                if feature_missing("memory.hindsight_embedded"):
+                    return
+            except Exception:
+                return
+
             def _start_daemon():
                 import traceback
                 log_dir = get_hermes_home() / "logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
                 log_path = log_dir / "hindsight-embed.log"
                 try:
+                    # The shared dependency gate must run before any embedded
+                    # runtime import, including the daemon manager import.
+                    client = self._get_client()
+
                     # Redirect the daemon manager's Rich console to our log file
                     # instead of stderr. This avoids global fd redirects that
                     # would capture output from other threads.
                     import hindsight_embed.daemon_embed_manager as dem
                     from rich.console import Console
                     dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
-
-                    client = self._get_client()
                     profile = self._config.get("profile", "hermes")
 
                     # Update the profile .env to match our current config so

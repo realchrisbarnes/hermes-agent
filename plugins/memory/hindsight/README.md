@@ -14,7 +14,7 @@ Long-term memory with knowledge graph, entity resolution, and multi-strategy ret
 hermes memory setup    # select "hindsight"
 ```
 
-The setup wizard will install dependencies automatically via `uv` and walk you through configuration.
+After you choose a mode, the setup wizard uses Hermes' allowlisted lazy-dependency gate and walks you through configuration. Object construction and session initialization never install packages.
 
 Or manually (cloud mode with defaults):
 ```bash
@@ -144,4 +144,4 @@ Available in `hybrid` and `tools` memory modes:
 
 ## Client Version
 
-Requires `hindsight-client >= 0.6.1`. The plugin auto-upgrades on session start if an older version is detected.
+Cloud and local-external modes use the pinned `hindsight-client == 0.6.1`; embedded mode uses the bounded `hindsight-all >= 0.4.22, < 0.7` range that introduced the embedded API while limiting pre-1.0 drift. Missing dependencies are acquired only at explicit setup or first client use through Hermes' gated allowlist. Session initialization never upgrades packages.

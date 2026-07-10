@@ -390,7 +390,7 @@ hermes config set memory.provider hindsight
 echo "HINDSIGHT_API_KEY=your-key" >> ~/.hermes/.env
 ```
 
-The setup wizard installs dependencies automatically and only installs what's needed for the selected mode (`hindsight-client` for cloud, `hindsight-all` for local). Requires `hindsight-client >= 0.4.22` (auto-upgraded on session start if outdated).
+The setup wizard installs only the dependency needed for the selected mode (`hindsight-client == 0.6.1` for cloud or local-external, `hindsight-all >= 0.4.22, < 0.7` for embedded local). The same allowlisted installer may run on first client use if setup was skipped. Session startup never installs or upgrades packages.
 
 **Local mode UI:** `hindsight-embed -p hermes ui start`
 
