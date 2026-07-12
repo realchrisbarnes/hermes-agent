@@ -1148,18 +1148,20 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+) -> List[str]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
     send_video, send_document) based on file extension — mirroring the routing logic
-    in ``BasePlatformAdapter._process_message_background``.
+    in ``BasePlatformAdapter._process_message_background``. Returns one error
+    per attachment that was not explicitly confirmed by the adapter.
     """
     from pathlib import Path
 
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    errors: List[str] = []
 
     for media_path, _is_voice in media_files:
         try:
@@ -1177,23 +1179,37 @@ def _send_media_via_adapter(
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
-                logger.warning(
-                    "Job '%s': cannot send media %s, gateway loop unavailable",
-                    job.get("id", "?"), media_path,
+                msg = (
+                    f"media delivery unconfirmed for {Path(media_path).name}: "
+                    "gateway loop unavailable"
                 )
-                return
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
+                continue
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
                 future.cancel()
                 raise
-            if result and not getattr(result, "success", True):
-                logger.warning(
-                    "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+            if not _confirm_adapter_delivery(result):
+                detail = getattr(result, "error", None) if result is not None else None
+                if not detail:
+                    detail = (
+                        f"unconfirmed result ({type(result).__name__}); "
+                        "explicit success=true was not returned"
+                    )
+                msg = (
+                    f"media delivery unconfirmed for {Path(media_path).name}: "
+                    f"{detail}"
                 )
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
         except Exception as e:
-            logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            msg = f"media delivery failed for {Path(media_path).name}: {e}"
+            logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+            errors.append(msg)
+
+    return errors
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -1207,14 +1223,58 @@ def _confirm_adapter_delivery(send_result) -> bool:
 
     Likewise, an object missing a ``success`` attribute (e.g. a bare ``dict``
     or a partial mock) is a contract violation: it does not actually tell us
-    whether the send succeeded.  Require an explicit, truthy ``success``
-    attribute to count as confirmed.
+    whether the send succeeded.  Require the literal boolean ``True`` in the
+    ``success`` attribute to count as confirmed.
     """
     if send_result is None:
         return False
     if not hasattr(send_result, "success"):
         return False
-    return bool(getattr(send_result, "success"))
+    return getattr(send_result, "success") is True
+
+
+def _delivery_message_id(send_result) -> Optional[str]:
+    """Return a platform message ID only from a confirmed delivery result."""
+    if isinstance(send_result, dict):
+        if (
+            send_result.get("success") is not True
+            or send_result.get("delivered") is False
+            or send_result.get("error")
+        ):
+            return None
+        message_id = send_result.get("message_id")
+    else:
+        if getattr(send_result, "success", None) is not True:
+            return None
+        message_id = getattr(send_result, "message_id", None)
+    message_id_text = str(message_id or "").strip()
+    return message_id_text or None
+
+
+def _record_cron_delivery_receipt(
+    *, job: dict, platform, chat_id, thread_id, send_result
+) -> None:
+    """Best-effort redacted receipt; never changes the delivery result."""
+    message_id = _delivery_message_id(send_result)
+    if not message_id:
+        return
+    try:
+        from cron.delivery_receipts import record_platform_accepted_cron_delivery
+
+        record_platform_accepted_cron_delivery(
+            platform=platform,
+            job_id=job.get("id"),
+            chat_id=chat_id,
+            thread_id=thread_id,
+            outbound_message_id=message_id,
+            send_succeeded=True,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': proactive delivery receipt failed: %s",
+            job.get("id", "?"),
+            exc,
+        )
 
 
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
@@ -1279,8 +1339,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    extracted_media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(
+        delivery_content
+    )
+    media_files = BasePlatformAdapter.filter_media_delivery_paths(
+        extracted_media_files
+    )
+    rejected_media_count = len(extracted_media_files) - len(media_files)
+    if not cleaned_delivery_content.strip() and not media_files:
+        msg = "no deliverable text or media remained after processing MEDIA tags"
+        logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+        return msg
+    media_filter_errors = []
+    if rejected_media_count:
+        media_filter_errors.append(
+            f"{rejected_media_count} media attachment(s) rejected by "
+            "safe-path validation"
+        )
+    # The durable receipt schema proves only accepted text-only payloads.
+    # Media-only and mixed sends remain deliberately unreceipted because the
+    # aggregate sender result may identify the final attachment, not the text.
+    has_text_payload = bool(cleaned_delivery_content.strip())
+    text_receipt_eligible = has_text_payload and not extracted_media_files
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -1302,7 +1382,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
 
-    delivery_errors = []
+    delivery_errors = list(media_filter_errors)
 
     for target in targets:
         platform_name = target["platform"]
@@ -1355,6 +1435,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
+        standalone_retry_allowed = True
         target_errors = []
 
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
@@ -1487,6 +1568,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
+                partial_delivery = bool(media_filter_errors)
+                text_no_send = False
+                live_thread_fallback = False
+                live_text_route_ambiguous = False
+                send_result = None
+                receipt_thread_id = thread_id
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -1525,10 +1612,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             #
                             #   cancel() == False -> the coroutine was already
                             #     running on the gateway loop when the timeout
-                            #     fired; the request is in flight on the wire and
-                            #     cannot be un-sent.  Re-sending via standalone
-                            #     would be a guaranteed DUPLICATE, so treat it as
-                            #     delivered (assume-delivered).
+                            #     fired; the request may be in flight on the wire
+                            #     and cannot be un-sent.  Re-sending via standalone
+                            #     risks a DUPLICATE, but lack of confirmation must
+                            #     still fail closed as an unknown delivery outcome.
                             #
                             #   cancel() == True -> the scheduled callback never
                             #     started executing (loop wedged/backlogged for
@@ -1552,13 +1639,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             else:
                                 timed_out = True
                                 timeout_handled = True
-                                logger.warning(
-                                    "Job '%s': live adapter send to %s:%s timed out "
-                                    "after 60s; already dispatched (in flight), "
-                                    "assuming delivered (skipping standalone fallback "
-                                    "to avoid duplicate)",
-                                    job["id"], platform_name, chat_id,
+                                adapter_ok = False
+                                standalone_retry_allowed = False
+                                msg = (
+                                    f"live adapter delivery to {platform_name}:{chat_id} "
+                                    "is unconfirmed after timeout; the send was already "
+                                    "dispatched, so standalone retry was suppressed to "
+                                    "avoid a possible duplicate"
                                 )
+                                logger.warning(
+                                    "Job '%s': %s",
+                                    job["id"],
+                                    msg,
+                                )
+                                target_errors.append(msg)
+                                delivery_errors.append(msg)
                         except Exception as ex:
                             # A real send error (not a slow confirmation) — fall
                             # through to the standalone path so the message is
@@ -1568,9 +1663,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
                         if timeout_handled:
                             # The timeout branch above already decided the
-                            # outcome (assume-delivered if in flight, or
-                            # adapter_ok=False to fall through if never
-                            # dispatched).  send_result is None, so skip the
+                            # outcome (unconfirmed/no-retry if in flight, or
+                            # adapter_ok=False to fall through if never dispatched).
+                            # send_result is None, so skip the
                             # confirmation/thread-fallback inspection below.
                             pass
                         else:
@@ -1582,13 +1677,53 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # misread a dict, and so a None / success-less object
                             # is NOT counted as delivered (#47056).
                             if isinstance(send_result, dict):
-                                send_success = bool(send_result.get("success", False))
+                                text_no_send = send_result.get("delivered") is False
+                                if text_no_send:
+                                    partial_delivery = True
+                                    filtered_by = send_result.get("filtered")
+                                    reason = (
+                                        f"filtered by {filtered_by}"
+                                        if filtered_by
+                                        else "explicit delivered=false"
+                                    )
+                                    msg = (
+                                        f"live adapter did not deliver to "
+                                        f"{platform_name}:{chat_id}: {reason}"
+                                    )
+                                    logger.warning("Job '%s': %s", job["id"], msg)
+                                    target_errors.append(msg)
+                                    delivery_errors.append(msg)
+                                    # This is an explicit policy no-send, not a
+                                    # transport failure.  Do not bypass the
+                                    # router by retrying through standalone.
+                                    if not media_files:
+                                        continue
+                                send_success = send_result.get("success") is True
                                 send_raw_response = send_result.get("raw_response")
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
 
-                            if not send_success:
+                            if (
+                                send_success
+                                and platform == Platform.TELEGRAM
+                                and not is_private_dm_topic
+                                and isinstance(send_raw_response, dict)
+                                and "requested_thread_id" in send_raw_response
+                            ):
+                                # The Telegram adapter reports the effective
+                                # message_thread_id after normalizing General
+                                # topic 1 or resolving a named private topic.
+                                # Numeric direct-message topics use a separate
+                                # Bot API field and deliberately preserve the
+                                # configured route instead.
+                                receipt_thread_id = send_raw_response.get(
+                                    "requested_thread_id"
+                                )
+
+                            if text_no_send:
+                                pass
+                            elif not send_success:
                                 if isinstance(send_result, dict):
                                     err = send_result.get("error", "unknown")
                                     shape = "dict"
@@ -1613,6 +1748,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 and thread_id
                                 and send_raw_response.get("thread_fallback")
                             ):
+                                receipt_thread_id = None
+                                live_thread_fallback = True
                                 requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
                                 msg = (
                                     f"configured thread_id {requested_thread_id} for "
@@ -1620,6 +1757,71 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 )
                                 logger.warning("Job '%s': %s", job["id"], msg)
                                 delivery_errors.append(msg)
+                                partial_delivery = True
+
+                            if (
+                                send_success
+                                and platform == Platform.TELEGRAM
+                                and isinstance(send_raw_response, dict)
+                            ):
+                                raw_message_ids = send_raw_response.get("message_ids")
+                                if not isinstance(raw_message_ids, (list, tuple)):
+                                    raw_message_ids = []
+                                message_ids = [
+                                    str(message_id)
+                                    for message_id in raw_message_ids
+                                    if str(message_id or "").strip()
+                                ]
+                                if not message_ids:
+                                    message_id = _delivery_message_id(send_result)
+                                    if message_id:
+                                        message_ids = [message_id]
+
+                                route_evidence = send_raw_response.get(
+                                    "text_delivery_thread_ids"
+                                )
+                                if isinstance(route_evidence, (list, tuple)):
+                                    normalized_routes = [
+                                        str(route) if route is not None else None
+                                        for route in route_evidence
+                                    ]
+                                    evidence_complete = (
+                                        bool(message_ids)
+                                        and len(normalized_routes) == len(message_ids)
+                                    )
+                                    homogeneous = (
+                                        evidence_complete
+                                        and len(set(normalized_routes)) == 1
+                                    )
+                                    if (
+                                        not homogeneous
+                                        or (
+                                            live_thread_fallback
+                                            and normalized_routes[0] is not None
+                                        )
+                                    ):
+                                        live_text_route_ambiguous = True
+                                    else:
+                                        receipt_thread_id = normalized_routes[0]
+                                elif live_thread_fallback and len(message_ids) != 1:
+                                    # A fallback flag is aggregate for the whole
+                                    # send. With multiple chunks and no per-ID
+                                    # routes, we cannot know which chunks landed
+                                    # in the topic versus the flat chat.
+                                    live_text_route_ambiguous = True
+
+                                if live_text_route_ambiguous:
+                                    receipt_thread_id = None
+                                    partial_delivery = True
+                                    msg = (
+                                        f"live text delivery route for "
+                                        f"{platform_name}:{chat_id} is ambiguous "
+                                        f"across {len(message_ids) or 'unknown'} "
+                                        "message chunk(s); route-specific receipt, "
+                                        "mirror, and seed were suppressed"
+                                    )
+                                    logger.warning("Job '%s': %s", job["id"], msg)
+                                    delivery_errors.append(msg)
 
                 # Send extracted media files as native attachments via the live
                 # adapter, using the same DM-topic-aware routing as the text send
@@ -1627,11 +1829,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # the General lane for private DM topics).  Skip on an in-flight
                 # confirmation timeout: the gateway loop is contended, so each
                 # media send would also block its 30s budget, and the text
-                # payload is already assumed delivered (#38922).  Record the
-                # skipped attachments so the drop is visible rather than silently
-                # lost.
+                # payload may already be in flight. Record the skipped attachments
+                # so the unconfirmed outcome is visible rather than silently lost.
                 if adapter_ok and not timed_out and media_files:
-                    _send_media_via_adapter(
+                    media_errors = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -1640,7 +1841,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
+                    if media_errors:
+                        partial_delivery = True
+                        target_errors.extend(media_errors)
+                        delivery_errors.extend(media_errors)
+                        if not text_to_send or text_no_send:
+                            # No component was explicitly confirmed. Keep the
+                            # failure terminal and do not risk a duplicate via
+                            # standalone after an ambiguous live send.
+                            continue
                 elif timed_out and media_files:
+                    partial_delivery = True
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
                         f"{platform_name}:{chat_id} (live adapter confirmation timed out)"
@@ -1649,11 +1860,63 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     delivery_errors.append(msg)
 
                 if adapter_ok:
-                    logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
+                    if (
+                        text_receipt_eligible
+                        and not timed_out
+                        and not live_text_route_ambiguous
+                    ):
+                        _record_cron_delivery_receipt(
+                            job=job,
+                            platform=platform_name,
+                            chat_id=chat_id,
+                            thread_id=receipt_thread_id,
+                            send_result=send_result,
+                        )
+                    if partial_delivery:
+                        logger.warning(
+                            "Job '%s': partial delivery to %s:%s via live adapter; "
+                            "one or more requested components were not confirmed",
+                            job["id"],
+                            platform_name,
+                            chat_id,
+                        )
+                    else:
+                        logger.info(
+                            "Job '%s': delivered to %s:%s via live adapter",
+                            job["id"],
+                            platform_name,
+                            chat_id,
+                        )
                     delivered = True
+                    live_flat_seeded = False
+                    if (
+                        live_thread_fallback
+                        and mirror_this_target
+                        and not text_no_send
+                        and not live_text_route_ambiguous
+                    ):
+                        # Telegram accepted the body only after dropping the
+                        # rejected topic. Seed the effective flat conversation,
+                        # never the stale/opened topic that did not accept it.
+                        live_flat_seeded = _seed_cron_channel_session(
+                            job,
+                            runtime_adapter,
+                            platform_name,
+                            chat_id,
+                            mirror_text,
+                            is_dm=is_dm_target,
+                            user_id=origin_user_id,
+                            chat_name=origin.get("chat_name"),
+                        )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
-                    if opened_thread_id and not thread_seeded:
+                    if (
+                        opened_thread_id
+                        and not thread_seeded
+                        and not text_no_send
+                        and not live_thread_fallback
+                        and not live_text_route_ambiguous
+                    ):
                         _seed_cron_thread_session(
                             job, runtime_adapter, platform_name, chat_id,
                             opened_thread_id, mirror_text,
@@ -1664,7 +1927,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     # session (the shipped mirror only appends to an existing
                     # session — the flat row is otherwise absent for a
                     # chat_postMessage delivery, so the brief would be lost).
-                    if in_channel_surface and mirror_this_target and not thread_seeded:
+                    if (
+                        in_channel_surface
+                        and mirror_this_target
+                        and not thread_seeded
+                        and not live_flat_seeded
+                        and not text_no_send
+                        and not live_text_route_ambiguous
+                    ):
                         inchannel_seeded = _seed_cron_channel_session(
                             job, runtime_adapter, platform_name, chat_id,
                             mirror_text, is_dm=is_dm_target,
@@ -1673,8 +1943,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         )
                     _maybe_mirror_cron_delivery(
                         job, platform_name, chat_id, mirror_text,
-                        thread_id=thread_id, user_id=origin_user_id,
-                        enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
+                        thread_id=receipt_thread_id, user_id=origin_user_id,
+                        enabled=(
+                            mirror_this_target
+                            and not thread_seeded
+                            and not inchannel_seeded
+                            and not live_flat_seeded
+                            and not text_no_send
+                            and not live_text_route_ambiguous
+                        ),
                     )
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
@@ -1685,7 +1962,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     job["id"], err_msg,
                 )
 
-        if not delivered:
+        if not delivered and standalone_retry_allowed:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
@@ -1724,18 +2001,139 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
-            if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
+            if not isinstance(result, dict):
+                msg = (
+                    f"delivery to {platform_name}:{chat_id} returned unconfirmed "
+                    f"result ({type(result).__name__})"
+                )
+                logger.error("Job '%s': %s", job["id"], msg)
+                target_errors.extend([msg])
+                delivery_errors.extend(target_errors)
+                continue
+            if result.get("success") is not True or result.get("delivered") is False:
+                detail = result.get("error") or "explicit success=true was not returned"
+                msg = f"delivery error: {detail} (unconfirmed result)"
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
                 continue
 
+            text_route_evidence = result.get("text_delivery_thread_ids")
+            standalone_text_route_ambiguous = bool(
+                platform == Platform.TELEGRAM
+                and result.get("text_delivery_route_ambiguous") is True
+            )
+            if (
+                platform == Platform.TELEGRAM
+                and isinstance(text_route_evidence, (list, tuple))
+            ):
+                normalized_text_routes = [
+                    str(route) if route is not None else None
+                    for route in text_route_evidence
+                ]
+                if len(set(normalized_text_routes)) > 1:
+                    standalone_text_route_ambiguous = True
+
+            effective_delivery_thread_id = thread_id
+            if platform == Platform.TELEGRAM:
+                if standalone_text_route_ambiguous:
+                    effective_delivery_thread_id = None
+                elif has_text_payload and "text_delivery_thread_id" in result:
+                    # Mirror the cron body where its text was accepted. A later
+                    # attachment fallback has its own media route and must not
+                    # overwrite the text continuation route.
+                    effective_delivery_thread_id = result.get(
+                        "text_delivery_thread_id"
+                    )
+                elif "delivery_thread_id" in result:
+                    effective_delivery_thread_id = result.get(
+                        "delivery_thread_id"
+                    )
+
+            if platform == Platform.TELEGRAM and standalone_text_route_ambiguous:
+                msg = (
+                    f"partial delivery to {platform_name}:{chat_id}: text chunks "
+                    "have heterogeneous effective routes; route-specific receipt, "
+                    "mirror, and seed were suppressed"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+            elif platform == Platform.TELEGRAM and result.get("thread_fallback") is True:
+                if result.get("text_thread_fallback") is True:
+                    detail = (
+                        f"configured thread_id {thread_id} was rejected for text; "
+                        "the body was accepted only on the flat route"
+                    )
+                elif result.get("media_thread_fallback") is True:
+                    detail = (
+                        f"configured thread_id {thread_id} was rejected for one "
+                        "or more media components; the text route was preserved"
+                    )
+                else:
+                    detail = (
+                        f"configured thread_id {thread_id} was rejected for one "
+                        "or more components; a flat fallback was used"
+                    )
+                msg = f"partial delivery to {platform_name}:{chat_id}: {detail}"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+
+            warnings = result.get("warnings")
+            if media_files and isinstance(warnings, (list, tuple)):
+                warning_count = sum(
+                    1 for warning in warnings if str(warning or "").strip()
+                )
+                if warning_count:
+                    # The sender's structured warning field is authoritative in
+                    # a request that included validated media.  Do not regex-scan
+                    # arbitrary prose or downgrade unrelated text-only warnings.
+                    msg = (
+                        f"partial delivery to {platform_name}:{chat_id}: "
+                        f"{warning_count} media delivery warning(s) reported"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+
+            if text_receipt_eligible and not standalone_text_route_ambiguous:
+                _record_cron_delivery_receipt(
+                    job=job,
+                    platform=platform_name,
+                    chat_id=chat_id,
+                    thread_id=effective_delivery_thread_id,
+                    send_result=result,
+                )
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            standalone_flat_seeded = False
+            if (
+                platform == Platform.TELEGRAM
+                and result.get("thread_fallback") is True
+                and effective_delivery_thread_id is None
+                and not standalone_text_route_ambiguous
+                and mirror_this_target
+                and runtime_adapter is not None
+            ):
+                # The platform accepted only the flat fallback route. Seed that
+                # exact continuation bucket; never seed the configured stale
+                # topic that rejected the delivery.
+                standalone_flat_seeded = _seed_cron_channel_session(
+                    job,
+                    runtime_adapter,
+                    platform_name,
+                    chat_id,
+                    mirror_text,
+                    is_dm=is_dm_target,
+                    user_id=origin_user_id,
+                    chat_name=origin.get("chat_name"),
+                )
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
-                thread_id=thread_id, user_id=origin_user_id,
-                enabled=mirror_this_target and not thread_seeded,
+                thread_id=effective_delivery_thread_id, user_id=origin_user_id,
+                enabled=(
+                    mirror_this_target
+                    and not thread_seeded
+                    and not standalone_flat_seeded
+                    and not standalone_text_route_ambiguous
+                ),
             )
 
     if delivery_errors:
@@ -3084,7 +3482,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    outcome: Optional[dict] = None,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -3098,6 +3503,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
+    When ``outcome`` is supplied, it is populated before ``mark_job_run`` so a
+    finite one-shot can report its execution and delivery result even when that
+    call removes the completed job from storage.
     """
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
@@ -3112,6 +3520,16 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
+            if outcome is not None:
+                outcome.update(
+                    {
+                        "execution_success": False,
+                        "execution_error": "One-shot dispatch limit reached; job was not run.",
+                        "delivery_state": "not_attempted",
+                        "delivery_attempted": False,
+                        "delivery_error": None,
+                    }
+                )
             return True  # not an error — already handled/removed
 
         # Run the job under the profile's secret scope. get_secret() fails
@@ -3158,12 +3576,28 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             should_deliver = False
 
         delivery_error = None
+        delivery_attempted = False
+        delivery_state = "not_requested"
         if should_deliver:
+            try:
+                delivery_attempted = bool(_resolve_delivery_targets(job))
+            except Exception:
+                # _deliver_result owns the authoritative error handling below.
+                # This probe is only for honest attempted-vs-local reporting.
+                delivery_attempted = False
             try:
                 delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)
+            if delivery_error:
+                delivery_state = "failed"
+            elif delivery_attempted:
+                delivery_state = "succeeded"
+            else:
+                # deliver=local and deliver=origin with no resolvable gateway
+                # target save output locally but perform no outbound delivery.
+                delivery_state = "local_only"
 
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
@@ -3172,11 +3606,33 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        if outcome is not None:
+            outcome.update(
+                {
+                    "execution_success": bool(success),
+                    "execution_error": error,
+                    "delivery_state": delivery_state,
+                    "delivery_attempted": delivery_attempted,
+                    "delivery_error": delivery_error,
+                    "completed_at": _hermes_now().isoformat(),
+                }
+            )
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
+        if outcome is not None:
+            outcome.update(
+                {
+                    "execution_success": False,
+                    "execution_error": str(e),
+                    "delivery_state": outcome.get("delivery_state", "not_attempted"),
+                    "delivery_attempted": outcome.get("delivery_attempted", False),
+                    "delivery_error": outcome.get("delivery_error"),
+                    "completed_at": _hermes_now().isoformat(),
+                }
+            )
         mark_job_run(job["id"], False, str(e))
         return False
 

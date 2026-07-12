@@ -1,6 +1,7 @@
 """Tests for hermes_cli.cron command handling."""
 
 from argparse import Namespace
+from unittest.mock import patch
 
 import pytest
 
@@ -35,7 +36,77 @@ class TestCronCommandLifecycle:
         out = capsys.readouterr().out
         assert "Paused job" in out
         assert "Resumed job" in out
-        assert "Triggered job" in out
+        assert "Execution" in out
+
+    @pytest.mark.parametrize(
+        "job_result",
+        [
+            {
+                "executed": True,
+                "execution_success": False,
+                "execution_error": "provider failed",
+                "delivery_state": "not_attempted",
+            },
+            {
+                "executed": True,
+                "execution_success": True,
+                "last_delivery_error": "telegram delivery failed",
+                "delivery_state": "failed",
+            },
+        ],
+    )
+    def test_run_returns_nonzero_for_execution_or_delivery_failure(
+        self, job_result, capsys
+    ):
+        result = {
+            "success": True,
+            "job": {
+                "job_id": "job-failed",
+                "name": "failed manual run",
+                **job_result,
+            },
+        }
+        with patch("hermes_cli.cron._cron_api", return_value=result):
+            rc = cron_command(
+                Namespace(cron_command="run", job_id="job-failed")
+            )
+
+        assert rc == 1
+        output = capsys.readouterr().out.lower()
+        assert "failed" in output
+        assert "triggered job" not in output
+
+    def test_run_local_success_does_not_claim_outbound_delivery(self, capsys):
+        result = {
+            "success": True,
+            "job": {
+                "job_id": "job-local",
+                "name": "local manual run",
+                "executed": True,
+                "execution_success": True,
+                "delivery_state": "local_only",
+                "delivery_attempted": False,
+                "last_delivery_error": None,
+            },
+        }
+        with patch("hermes_cli.cron._cron_api", return_value=result):
+            rc = cron_command(Namespace(cron_command="run", job_id="job-local"))
+
+        output = capsys.readouterr().out.lower()
+        assert rc == 0
+        assert "execution succeeded" in output
+        assert "local-only" in output
+        assert "no outbound delivery attempted" in output
+        assert "delivery succeeded" not in output
+
+    def test_cmd_cron_propagates_nonzero_status_to_shell(self):
+        from hermes_cli.main import cmd_cron
+
+        with patch("hermes_cli.cron.cron_command", return_value=1), \
+             pytest.raises(SystemExit) as exc_info:
+            cmd_cron(Namespace(cron_command="run", job_id="job-failed"))
+
+        assert exc_info.value.code == 1
 
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(

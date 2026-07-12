@@ -1020,7 +1020,57 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     Matches the gateway adapter's ``_is_thread_not_found_error`` for
     the standalone ``_send_telegram`` path (issue #27012).
     """
-    return "thread not found" in str(error).lower()
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "thread not found",
+            "message thread not found",
+            "direct_messages_topic",
+            "topic not found",
+            "topic deleted",
+            "topic_closed",
+        )
+    )
+
+
+def _telegram_standalone_thread_kwargs(chat_id, thread_id):
+    """Return Bot API routing kwargs for Telegram's three topic modes."""
+    if thread_id is None:
+        return {}
+
+    from gateway.delivery import _looks_like_int, looks_like_telegram_private_chat_id
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    thread_text = str(thread_id)
+    metadata = None
+    adapter_thread_id = thread_text
+    if (
+        looks_like_telegram_private_chat_id(str(chat_id))
+        and _looks_like_int(thread_text)
+    ):
+        metadata = {"direct_messages_topic_id": thread_text}
+        adapter_thread_id = None
+    return {
+        key: value
+        for key, value in TelegramAdapter._thread_kwargs_for_send(
+            str(chat_id), adapter_thread_id, metadata
+        ).items()
+        if value is not None
+    }
+
+
+def _telegram_delivery_thread_id(routing_kwargs):
+    """Return the effective topic identifier from Telegram Bot API kwargs."""
+    topic_id = routing_kwargs.get("direct_messages_topic_id")
+    if topic_id is None:
+        topic_id = routing_kwargs.get("message_thread_id")
+    return str(topic_id) if topic_id is not None else None
+
+
+def _clear_telegram_topic_routing(routing_kwargs):
+    routing_kwargs.pop("message_thread_id", None)
+    routing_kwargs.pop("direct_messages_topic_id", None)
 
 
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
@@ -1085,29 +1135,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         # rather than force-int so username home channels don't crash (#13206).
         int_chat_id = normalize_telegram_chat_id(chat_id)
         media_files = media_files or []
-        thread_kwargs = {}
-        if thread_id is not None:
-            # Reuse the gateway adapter's General-topic mapping: in Telegram
-            # forum supergroups, the General topic is addressed as
-            # message_thread_id="1" on incoming updates, but Bot API
-            # sendMessage rejects message_thread_id=1 with "Message thread
-            # not found". The adapter's helper maps "1" to None for that
-            # reason; the send_message tool needs the same mapping or a
-            # send to a forum group's General topic always errors out
-            # (see issue #22267).
-            try:
-                from plugins.platforms.telegram.adapter import TelegramAdapter
-                effective_thread_id = TelegramAdapter._message_thread_id_for_send(
-                    str(thread_id)
-                )
-            except Exception:
-                # Fallback: explicit mapping in case the adapter import
-                # fails (e.g. python-telegram-bot missing in this venv).
-                effective_thread_id = (
-                    None if str(thread_id) == "1" else int(thread_id)
-                )
-            if effective_thread_id is not None:
-                thread_kwargs["message_thread_id"] = effective_thread_id
+        # Share the live adapter's canonical three-mode routing: private-chat
+        # numeric topics use direct_messages_topic_id; forum topics use
+        # message_thread_id; forum General topic 1 is sent flat.
+        thread_kwargs = _telegram_standalone_thread_kwargs(chat_id, thread_id)
         # disable_web_page_preview is only valid for send_message, not
         # send_photo/send_video/etc.  Keep it separate so media sends
         # don't inherit an invalid parameter (issue #27012).
@@ -1116,6 +1147,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_kwargs["disable_web_page_preview"] = True
 
         last_msg = None
+        thread_fallback = False
+        text_thread_fallback = False
+        media_thread_fallback = False
+        text_delivery_thread_ids = []
+        media_delivery_thread_ids = []
         warnings = []
 
         if formatted.strip():
@@ -1137,21 +1173,30 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         chat_id=int_chat_id, text=chunk,
                         parse_mode=send_parse_mode, **text_kwargs
                     )
+                    text_delivery_thread_ids.append(
+                        _telegram_delivery_thread_id(text_kwargs)
+                    )
                 except Exception as md_error:
-                    # Thread not found — retry without message_thread_id so the
-                    # message still delivers (matching the gateway adapter's
-                    # fallback behaviour, issue #27012).
-                    if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
+                    # A stale topic can still fall back to the flat chat.  Keep
+                    # that outcome explicit so the scheduler reports partial.
+                    if (
+                        _is_telegram_thread_not_found(md_error)
+                        and _telegram_delivery_thread_id(text_kwargs) is not None
+                    ):
                         logger.warning(
-                            "Thread %s not found in _send_telegram, retrying without message_thread_id",
-                            text_kwargs.get("message_thread_id"),
+                            "Topic %s not found in _send_telegram, retrying without topic routing",
+                            _telegram_delivery_thread_id(text_kwargs),
                         )
-                        text_kwargs.pop("message_thread_id", None)
+                        _clear_telegram_topic_routing(text_kwargs)
+                        _clear_telegram_topic_routing(thread_kwargs)
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=chunk,
                             parse_mode=send_parse_mode, **text_kwargs
                         )
+                        text_delivery_thread_ids.append(None)
+                        thread_fallback = True
+                        text_thread_fallback = True
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
                         logger.warning(
                             "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
@@ -1170,6 +1215,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             bot,
                             chat_id=int_chat_id, text=plain,
                             parse_mode=None, **text_kwargs
+                        )
+                        text_delivery_thread_ids.append(
+                            _telegram_delivery_thread_id(text_kwargs)
                         )
                     else:
                         raise
@@ -1206,17 +1254,23 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             last_msg = await bot.send_document(
                                 chat_id=int_chat_id, document=f, **media_kwargs
                             )
+                        media_delivery_thread_ids.append(
+                            _telegram_delivery_thread_id(media_kwargs)
+                        )
                     except Exception as media_err:
-                        if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
-                            # Thread not found for media — retry without
-                            # message_thread_id (issue #27012).
+                        if (
+                            _is_telegram_thread_not_found(media_err)
+                            and _telegram_delivery_thread_id(media_kwargs) is not None
+                        ):
+                            # A stale topic can fall back once to the flat route.
                             logger.warning(
-                                "Thread %s not found for media send, retrying without message_thread_id",
-                                media_kwargs["message_thread_id"],
+                                "Topic %s not found for media send, retrying without topic routing",
+                                _telegram_delivery_thread_id(media_kwargs),
                             )
                             # Re-seek the file since the first attempt consumed it
                             f.seek(0)
-                            media_kwargs.pop("message_thread_id", None)
+                            _clear_telegram_topic_routing(media_kwargs)
+                            _clear_telegram_topic_routing(thread_kwargs)
                             if ext in _IMAGE_EXTS and not force_document:
                                 last_msg = await bot.send_photo(
                                     chat_id=int_chat_id, photo=f, **media_kwargs
@@ -1237,6 +1291,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                 last_msg = await bot.send_document(
                                     chat_id=int_chat_id, document=f, **media_kwargs
                                 )
+                            media_delivery_thread_ids.append(None)
+                            thread_fallback = True
+                            media_thread_fallback = True
                         else:
                             raise
             except Exception as e:
@@ -1250,11 +1307,41 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 return {"error": error, "warnings": warnings}
             return {"error": error}
 
+        text_delivery_route_ambiguous = (
+            len(set(text_delivery_thread_ids)) > 1
+        )
+        text_delivery_thread_id = (
+            text_delivery_thread_ids[-1]
+            if text_delivery_thread_ids and not text_delivery_route_ambiguous
+            else None
+        )
+        media_delivery_thread_id = (
+            media_delivery_thread_ids[-1] if media_delivery_thread_ids else None
+        )
+        # The cron body is the text component, so its effective route is the
+        # aggregate route whenever text was delivered. A later media fallback
+        # must not overwrite that route with the attachment's flat fallback.
+        # Heterogeneous text routes intentionally collapse to no canonical
+        # route; callers must suppress route-specific receipts and mirroring.
+        delivery_thread_id = (
+            text_delivery_thread_id
+            if text_delivery_thread_ids
+            else media_delivery_thread_id
+        )
         result = {
             "success": True,
             "platform": "telegram",
             "chat_id": chat_id,
             "message_id": str(last_msg.message_id),
+            "delivery_thread_id": delivery_thread_id,
+            "text_delivery_thread_id": text_delivery_thread_id,
+            "text_delivery_thread_ids": text_delivery_thread_ids,
+            "text_delivery_route_ambiguous": text_delivery_route_ambiguous,
+            "media_delivery_thread_id": media_delivery_thread_id,
+            "media_delivery_thread_ids": media_delivery_thread_ids,
+            "thread_fallback": thread_fallback,
+            "text_thread_fallback": text_thread_fallback,
+            "media_thread_fallback": media_thread_fallback,
         }
         if warnings:
             result["warnings"] = warnings

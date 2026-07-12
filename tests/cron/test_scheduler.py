@@ -3116,17 +3116,16 @@ class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter
     delivery path, the outcome depends on whether the coroutine was already
     running.  future.cancel() returning False means it is in flight on the wire
-    (cannot be un-sent) → treat as DELIVERED and skip the standalone fallback to
-    avoid a duplicate (#38922).  future.cancel() returning True means it never
-    started (wedged loop) → nothing was sent, so fall through to standalone or
-    the message is silently dropped.  Regression for #38922.
+    (cannot be un-sent) → report an unconfirmed terminal outcome and skip the
+    standalone fallback to avoid a duplicate. future.cancel() returning True
+    means it never started (wedged loop) → nothing was sent, so fall through to
+    standalone or the message is silently dropped. Regression for #38922.
     """
 
-    def test_live_adapter_timeout_assumes_delivered_no_duplicate(self):
+    def test_live_adapter_timeout_is_unconfirmed_without_duplicate(self):
         """End-to-end: live adapter confirmation times out past the 60s budget.
-        The fix (#38922) treats the send as already-dispatched/delivered and
-        does NOT run the standalone fallback — otherwise the message is sent
-        twice."""
+        The send is already dispatched, so no standalone retry is safe; however,
+        lack of platform confirmation must not become a clean success."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
@@ -3172,7 +3171,8 @@ class TestDeliverResultTimeoutCancelsFuture:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
-             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send), \
+             patch("cron.scheduler._record_cron_delivery_receipt") as receipt:
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -3182,11 +3182,14 @@ class TestDeliverResultTimeoutCancelsFuture:
 
         # 1. cancel() was attempted (returned False = in flight).
         assert cancel_calls == [True], "future.cancel() should be attempted on TimeoutError"
-        # 2. Delivery is reported successful (no error string returned).
-        assert result is None, f"expected successful delivery, got error: {result!r}"
-        # 3. The standalone fallback must NOT run — that is the #38922 fix:
-        #    an in-flight confirmation timeout is assume-delivered, not a resend.
+        # 2. Delivery is explicitly unconfirmed, not assumed successful.
+        assert result is not None
+        assert "unconfirmed after timeout" in result
+        assert "possible duplicate" in result
+        # 3. The standalone fallback and receipt must NOT run: the send remains
+        #    unconfirmed, but an in-flight retry could duplicate it.
         standalone_send.assert_not_awaited()
+        receipt.assert_not_called()
 
     def test_live_adapter_timeout_before_dispatch_falls_back_to_standalone(self):
         """When the coroutine never started (loop wedged) — future.cancel()

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -625,9 +627,89 @@ def test_cron_pause_resume_and_run_require_confirmation(_isolate_hermes_home):
     assert stored is not None
     assert stored["state"] == "scheduled"
 
-    triggered = engine.execute("cron run alpha", confirmed=True)
+    with patch(
+        "tools.cronjob_tools.cronjob",
+        return_value=json.dumps(
+            {
+                "success": True,
+                "job": {
+                    "job_id": job["id"],
+                    "name": "alpha",
+                    "state": "scheduled",
+                    "executed": True,
+                    "execution_success": True,
+                    "delivery_state": "local_only",
+                    "delivery_attempted": False,
+                    "last_delivery_error": None,
+                },
+            }
+        ),
+    ):
+        triggered = engine.execute("cron run alpha", confirmed=True)
     assert triggered.status == "ok"
-    assert "Triggered job" in triggered.output
+    assert "Ran job" in triggered.output
+
+
+@pytest.mark.parametrize(
+    "job_result",
+    [
+        {
+            "executed": True,
+            "execution_success": False,
+            "execution_error": "provider failed",
+            "delivery_state": "not_attempted",
+        },
+        {
+            "executed": True,
+            "execution_success": True,
+            "last_delivery_error": "telegram rejected delivery",
+            "delivery_state": "failed",
+        },
+    ],
+)
+def test_cron_run_console_surfaces_synchronous_failures(job_result):
+    engine = HermesConsoleEngine()
+    with patch(
+        "tools.cronjob_tools.cronjob",
+        return_value=json.dumps(
+            {
+                "success": True,
+                "job": {"job_id": "job-failed", "name": "alpha", **job_result},
+            }
+        ),
+    ):
+        result = engine.execute("cron run alpha", confirmed=True)
+
+    assert result.status == "error"
+    assert "failed" in result.output.lower()
+
+
+def test_cron_run_console_local_success_is_explicit_about_no_delivery():
+    engine = HermesConsoleEngine()
+    with patch(
+        "tools.cronjob_tools.cronjob",
+        return_value=json.dumps(
+            {
+                "success": True,
+                "job": {
+                    "job_id": "job-local",
+                    "name": "alpha",
+                    "executed": True,
+                    "execution_success": True,
+                    "delivery_state": "local_only",
+                    "delivery_attempted": False,
+                    "last_delivery_error": None,
+                },
+            }
+        ),
+    ):
+        result = engine.execute("cron run alpha", confirmed=True)
+
+    assert result.status == "ok"
+    assert "execution succeeded" in result.output.lower()
+    assert "local-only" in result.output.lower()
+    assert "no outbound delivery attempted" in result.output.lower()
+    assert "delivery succeeded" not in result.output.lower()
 
 
 def test_repl_runs_non_interactive_lines_without_prompts(_isolate_hermes_home):

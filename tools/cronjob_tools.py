@@ -628,14 +628,32 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        run_outcome: Dict[str, Any] = {}
+        processed = run_one_job(job, outcome=run_outcome)
         refreshed = get_job(job_id) or {}
-        ok = refreshed.get("last_status") == "ok"
-        return {
+        if "execution_success" in run_outcome:
+            ok = bool(processed and run_outcome.get("execution_success") is True)
+            execution_error = run_outcome.get("execution_error")
+        else:
+            # Backward-compatible fallback for patched/legacy run_one_job
+            # implementations that do not populate the optional outcome sink.
+            ok = bool(processed and refreshed.get("last_status") == "ok")
+            execution_error = refreshed.get("last_error")
+        result = {
             "claimed": True,
-            "success": bool(processed and ok),
-            "error": refreshed.get("last_error"),
+            "success": ok,
+            "error": execution_error,
         }
+        if run_outcome:
+            result.update(
+                {
+                    "delivery_state": run_outcome.get("delivery_state", "unknown"),
+                    "delivery_attempted": run_outcome.get("delivery_attempted"),
+                    "delivery_error": run_outcome.get("delivery_error"),
+                    "completed_at": run_outcome.get("completed_at"),
+                }
+            )
+        return result
 
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
@@ -833,7 +851,54 @@ def cronjob(
             # from double-firing.
             exec_result = _execute_job_now(job)
             # Re-read so the response reflects the post-run last_run_at/last_status.
-            result = _format_job(get_job(job_id) or {"id": job_id})
+            # A completed finite one-shot may be removed by mark_job_run.  In
+            # that case synthesize an explicit terminal snapshot; formatting the
+            # pre-run job directly would falsely preserve enabled/scheduled and a
+            # stale next_run_at after the job no longer exists.
+            persisted_job = get_job(job_id)
+            removed_after_run = (
+                persisted_job is None and exec_result.get("claimed", False)
+            )
+            if removed_after_run:
+                terminal_job = dict(job)
+                repeat = dict(terminal_job.get("repeat") or {})
+                times = repeat.get("times")
+                if isinstance(times, int) and times > 0:
+                    repeat["completed"] = times
+                terminal_job.update(
+                    {
+                        "repeat": repeat or terminal_job.get("repeat"),
+                        "next_run_at": None,
+                        "enabled": False,
+                        "state": "completed",
+                        "last_run_at": exec_result.get("completed_at"),
+                        "last_status": (
+                            "ok" if exec_result.get("success") is True else "error"
+                        ),
+                        "last_error": exec_result.get("error"),
+                        "last_delivery_error": exec_result.get("delivery_error"),
+                    }
+                )
+                result = _format_job(terminal_job)
+                result["terminal"] = True
+                result["removed_after_run"] = True
+                if exec_result.get("success") is not True:
+                    terminal_outcome = "failed"
+                elif exec_result.get("delivery_error") or exec_result.get(
+                    "delivery_state"
+                ) == "failed":
+                    terminal_outcome = "failed"
+                elif exec_result.get("delivery_state") in {
+                    "succeeded",
+                    "local_only",
+                    "not_requested",
+                }:
+                    terminal_outcome = "succeeded"
+                else:
+                    terminal_outcome = "unknown"
+                result["terminal_outcome"] = terminal_outcome
+            else:
+                result = _format_job(persisted_job or job)
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
             if not exec_result.get("claimed", False):
@@ -842,6 +907,14 @@ def cronjob(
                 )
             elif exec_result.get("error"):
                 result["execution_error"] = exec_result["error"]
+            if exec_result.get("claimed", False):
+                result["delivery_state"] = exec_result.get(
+                    "delivery_state", "unknown"
+                )
+                result["delivery_attempted"] = exec_result.get(
+                    "delivery_attempted"
+                )
+                result["last_delivery_error"] = exec_result.get("delivery_error")
             return json.dumps({"success": True, "job": result}, indent=2)
 
         if normalized == "update":

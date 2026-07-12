@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
 from hermes_cli.subcommands.cron import build_cron_parser
 
 
@@ -83,3 +85,16 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_run_help_describes_immediate_synchronous_execution(capsys):
+    parser = _build()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["cron", "run", "--help"])
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out.lower()
+    assert "immediately" in help_text
+    assert "wait" in help_text or "synchronous" in help_text
+    assert "next scheduler tick" not in help_text

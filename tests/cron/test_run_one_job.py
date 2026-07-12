@@ -2,7 +2,7 @@
 
 `tick`'s per-job body (`_process_job`) is the execute → save → deliver → mark
 sequence that fires ONE due job. Phase 4A extracts it into a module-level
-`run_one_job(job, *, adapters=None, loop=None, verbose=False)` so the external
+`run_one_job(job, *, adapters=None, loop=None, verbose=False, outcome=None)` so the external
 Chronos provider's `fire_due` can reuse the IDENTICAL body — no duplicated
 correctness.
 
@@ -98,6 +98,38 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
     assert "deliver" in kinds  # failures always deliver
     mark = [c for c in calls if c[0] == "mark"][0]
     assert mark == ("mark", "j5", False)
+
+
+def test_run_one_job_outcome_propagates_delivery_failure(monkeypatch):
+    """Synchronous callers receive delivery failure separately from execution."""
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        s,
+        "_resolve_delivery_targets",
+        lambda _job: [{"platform": "telegram", "chat_id": "target"}],
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda *args, **kwargs: "live delivery filtered before platform send",
+    )
+    outcome = {}
+
+    ok = s.run_one_job(
+        {"id": "j5-delivery", "name": "t", "deliver": "telegram"},
+        outcome=outcome,
+    )
+
+    assert ok is True
+    completed_at = outcome.pop("completed_at")
+    assert completed_at
+    assert outcome == {
+        "execution_success": True,
+        "execution_error": None,
+        "delivery_state": "failed",
+        "delivery_attempted": True,
+        "delivery_error": "live delivery filtered before platform send",
+    }
 
 
 def test_run_one_job_exception_marks_failure(monkeypatch):

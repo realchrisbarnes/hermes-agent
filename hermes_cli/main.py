@@ -4215,7 +4215,10 @@ def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
 
-    cron_command(args)
+    exit_code = int(cron_command(args) or 0)
+    if exit_code:
+        raise SystemExit(exit_code)
+    return 0
 
 
 def cmd_webhook(args):

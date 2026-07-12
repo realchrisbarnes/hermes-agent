@@ -401,19 +401,48 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
     job = result.get("job") or result.get("removed_job") or {}
-    print(color(f"{success_verb} job: {job.get('name', job_id)} ({job_id})", Colors.GREEN))
-    if action in {"resume", "run"} and result.get("job", {}).get("next_run_at"):
-        print(f"  Next run: {result['job']['next_run_at']}")
-    if action == "run":
-        job = result.get("job", {})
-        if job.get("executed"):
-            outcome = "succeeded" if job.get("execution_success") else "failed"
-            print(f"  Ran now: {outcome}.")
-        elif job.get("execution_skipped"):
-            print(f"  {job['execution_skipped']}")
-        else:
-            print("  It will run on the next scheduler tick.")
-    return 0
+    if action != "run":
+        print(color(f"{success_verb} job: {job.get('name', job_id)} ({job_id})", Colors.GREEN))
+        if action == "resume" and job.get("next_run_at"):
+            print(f"  Next run: {job['next_run_at']}")
+        return 0
+
+    if not job.get("executed"):
+        detail = job.get("execution_skipped") or "Run did not execute synchronously."
+        print(color(f"Run failed for job: {job.get('name', job_id)} ({job_id})", Colors.RED))
+        print(color(f"  {detail}", Colors.RED))
+        return 1
+
+    execution_succeeded = job.get("execution_success") is True
+    delivery_state = job.get("delivery_state")
+    delivery_error = job.get("last_delivery_error")
+
+    if execution_succeeded:
+        print(f"Ran job: {job.get('name', job_id)} ({job_id})")
+        print(color("  Execution succeeded.", Colors.GREEN))
+    else:
+        detail = job.get("execution_error") or "execution failed"
+        print(color(f"Run failed for job: {job.get('name', job_id)} ({job_id})", Colors.RED))
+        print(color(f"  Execution failed: {detail}.", Colors.RED))
+
+    delivery_ok = False
+    if delivery_state == "succeeded" and not delivery_error:
+        print(color("  Delivery completed without reported error.", Colors.GREEN))
+        delivery_ok = True
+    elif delivery_state == "local_only" and not delivery_error:
+        print("  Delivery: local-only output saved; no outbound delivery attempted.")
+        delivery_ok = True
+    elif delivery_state == "not_requested" and not delivery_error:
+        print("  Delivery: not requested; no outbound delivery attempted.")
+        delivery_ok = True
+    elif delivery_state == "failed" or delivery_error:
+        print(color(f"  Delivery failed: {delivery_error or 'unknown delivery error'}", Colors.RED))
+    else:
+        print(color("  Delivery outcome unavailable; refusing to report success.", Colors.RED))
+
+    if job.get("next_run_at"):
+        print(f"  Next run: {job['next_run_at']}")
+    return 0 if execution_succeeded and delivery_ok else 1
 
 
 def cron_command(args):

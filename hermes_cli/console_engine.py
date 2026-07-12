@@ -694,7 +694,7 @@ class HermesConsoleEngine:
         self.register(
             ("cron", "run"),
             "cron run <job>",
-            "Run a job on the next scheduler tick.",
+            "Run a job immediately and wait for execution and delivery.",
             _cron_run,
             mutating=True,
             confirmation="Trigger this cron job?",
@@ -1815,15 +1815,45 @@ def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
 def _cron_run(_engine: HermesConsoleEngine, args: list[str]) -> str:
     if len(args) != 1:
         raise ConsoleCommandError("Usage: cron run <job>")
-    from cron.jobs import AmbiguousJobReference, trigger_job
+    from tools.cronjob_tools import cronjob
 
-    try:
-        job = trigger_job(args[0])
-    except AmbiguousJobReference as exc:
-        raise ConsoleCommandError(str(exc)) from exc
-    if not job:
-        raise ConsoleCommandError(f"Job not found: {args[0]}")
-    return _format_job(job, "Triggered")
+    result = json.loads(cronjob(action="run", job_id=args[0]))
+    if not result.get("success"):
+        raise ConsoleCommandError(
+            result.get("error") or f"Failed to run cron job: {args[0]}"
+        )
+
+    job = result.get("job") or {}
+    if not job.get("executed"):
+        raise ConsoleCommandError(
+            job.get("execution_skipped") or "Cron job did not execute synchronously"
+        )
+    if job.get("execution_success") is not True:
+        raise ConsoleCommandError(
+            f"Cron job execution failed: "
+            f"{job.get('execution_error') or 'unknown execution error'}"
+        )
+    delivery_state = job.get("delivery_state")
+    delivery_error = job.get("last_delivery_error")
+    if delivery_state == "failed" or delivery_error:
+        raise ConsoleCommandError(
+            f"Cron job delivery failed: {delivery_error or 'unknown delivery error'}"
+        )
+    if delivery_state == "succeeded":
+        delivery_summary = "Delivery completed without reported error."
+    elif delivery_state == "local_only":
+        delivery_summary = (
+            "Delivery: local-only output saved; no outbound delivery attempted."
+        )
+    elif delivery_state == "not_requested":
+        delivery_summary = "Delivery: not requested; no outbound delivery attempted."
+    else:
+        raise ConsoleCommandError(
+            "Cron job delivery outcome unavailable; refusing to report success"
+        )
+    return "\n".join(
+        (_format_job(job, "Ran"), "Execution succeeded.", delivery_summary)
+    )
 
 
 def run_console_repl(

@@ -79,3 +79,81 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         assert "boom" in res["error"]
         m_mark.assert_called_once()
+
+    def test_execute_job_now_retains_success_after_one_shot_is_removed(self):
+        """The inline result must not depend on re-reading an auto-deleted job."""
+        one_shot = {
+            **_JOB,
+            "schedule": {"kind": "once", "run_at": "2026-07-12T12:00:00Z"},
+            "repeat": {"times": 1, "completed": 0},
+        }
+
+        def run_and_remove(_job, *, outcome=None, **_kwargs):
+            outcome.update(
+                {
+                    "execution_success": True,
+                    "execution_error": None,
+                    "delivery_state": "local_only",
+                    "delivery_attempted": False,
+                    "delivery_error": None,
+                }
+            )
+            return True
+
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", side_effect=run_and_remove), \
+             patch("tools.cronjob_tools.get_job", return_value=None):
+            result = _execute_job_now(one_shot)
+
+        assert result == {
+            "claimed": True,
+            "success": True,
+            "error": None,
+            "delivery_state": "local_only",
+            "delivery_attempted": False,
+            "delivery_error": None,
+            "completed_at": None,
+        }
+
+    def test_removed_one_shot_returns_honest_terminal_snapshot(self):
+        one_shot = {
+            **_JOB,
+            "schedule": {"kind": "once", "run_at": "2026-07-12T12:00:00Z"},
+            "schedule_display": "2026-07-12T12:00:00Z",
+            "repeat": {"times": 1, "completed": 0},
+            "next_run_at": "2026-07-12T12:00:00Z",
+            "enabled": True,
+            "state": "scheduled",
+        }
+
+        def run_and_remove(_job, *, outcome=None, **_kwargs):
+            outcome.update(
+                {
+                    "execution_success": True,
+                    "execution_error": None,
+                    "delivery_state": "local_only",
+                    "delivery_attempted": False,
+                    "delivery_error": None,
+                    "completed_at": "2026-07-12T16:00:01+00:00",
+                }
+            )
+            return True
+
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=one_shot), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", side_effect=run_and_remove), \
+             patch("tools.cronjob_tools.get_job", return_value=None):
+            out = json.loads(cronjob(action="run", job_id=one_shot["id"]))
+
+        result = out["job"]
+        assert result["executed"] is True
+        assert result["execution_success"] is True
+        assert result["enabled"] is False
+        assert result["state"] == "completed"
+        assert result["next_run_at"] is None
+        assert result["last_run_at"] == "2026-07-12T16:00:01+00:00"
+        assert result["last_status"] == "ok"
+        assert result["repeat"] == "1/1"
+        assert result["terminal"] is True
+        assert result["removed_after_run"] is True
+        assert result["terminal_outcome"] == "succeeded"
