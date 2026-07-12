@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import stat
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -124,6 +125,51 @@ def test_receipt_is_redacted_profile_scoped_0600_and_single_append_write(
     ):
         assert record[field].startswith("sha256:")
         assert len(record[field]) == len("sha256:") + 64
+
+
+def test_duplicate_reply_pair_is_written_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    kwargs = {
+        "platform": "telegram",
+        "chat_id": "same-chat",
+        "inbound_message_id": "same-inbound",
+        "outbound_message_id": "same-outbound",
+        "send_succeeded": True,
+    }
+
+    assert delivery_receipts.record_platform_accepted_reply(**kwargs) is True
+    assert delivery_receipts.record_platform_accepted_reply(**kwargs) is False
+    assert len(_read_receipts(tmp_path)) == 1
+
+
+def test_duplicate_guard_is_thread_safe_and_profile_scoped(tmp_path, monkeypatch):
+    first_home = tmp_path / "first"
+    second_home = tmp_path / "second"
+    monkeypatch.setenv("HERMES_HOME", str(first_home))
+    kwargs = {
+        "platform": "telegram",
+        "chat_id": "concurrent-chat",
+        "inbound_message_id": "concurrent-inbound",
+        "outbound_message_id": "concurrent-outbound",
+        "send_succeeded": True,
+    }
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(
+            pool.map(
+                lambda _index: delivery_receipts.record_platform_accepted_reply(
+                    **kwargs
+                ),
+                range(16),
+            )
+        )
+
+    assert outcomes.count(True) == 1
+    assert len(_read_receipts(first_home)) == 1
+
+    monkeypatch.setenv("HERMES_HOME", str(second_home))
+    assert delivery_receipts.record_platform_accepted_reply(**kwargs) is True
+    assert len(_read_receipts(second_home)) == 1
 
 
 @pytest.mark.parametrize(

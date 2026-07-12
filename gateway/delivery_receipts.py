@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 RECEIPT_FILENAME = "platform-accepted-replies.jsonl"
 _SCHEMA_VERSION = "hermes.platform_accepted_reply.v1"
+_WRITTEN_REPLY_PAIRS: set[tuple[str, str]] = set()
+_WRITTEN_REPLY_PAIRS_LOCK = threading.Lock()
 
 
 def _composite_id_hash(
@@ -83,53 +86,68 @@ def record_platform_accepted_reply(
         return False
 
     try:
-        record = {
-            "schema_version": _SCHEMA_VERSION,
-            "recorded_at": datetime.now(timezone.utc).isoformat().replace(
-                "+00:00", "Z"
-            ),
-            "receipt_type": "platform_accepted_reply",
-            "delivery_state": "PLATFORM_ACCEPTED",
-            "human_received_or_read_proven": False,
-            "platform": platform_text,
-            "inbound_message_id_hash": _composite_id_hash(
-                platform=platform_text,
-                chat_id=chat_text,
-                direction="inbound",
-                message_id=inbound_text,
-            ),
-            "outbound_message_id_hash": _composite_id_hash(
-                platform=platform_text,
-                chat_id=chat_text,
-                direction="outbound",
-                message_id=outbound_text,
-            ),
-            "reply_pair_hash": _reply_pair_hash(
-                platform=platform_text,
-                chat_id=chat_text,
-                inbound_message_id=inbound_text,
-                outbound_message_id=outbound_text,
-            ),
-        }
-        payload = (
-            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode("utf-8")
+        reply_pair_hash = _reply_pair_hash(
+            platform=platform_text,
+            chat_id=chat_text,
+            inbound_message_id=inbound_text,
+            outbound_message_id=outbound_text,
+        )
+        hermes_home = get_hermes_home()
+        profile_key = os.path.normcase(os.path.realpath(os.fspath(hermes_home)))
+        dedup_key = (profile_key, reply_pair_hash)
 
-        log_dir = get_hermes_home() / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path = log_dir / RECEIPT_FILENAME
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        flags |= getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            # One O_APPEND write keeps each compact JSONL receipt contiguous
-            # when multiple platform sessions complete concurrently.
-            written = os.write(fd, payload)
-            return written == len(payload)
-        finally:
-            os.close(fd)
+        # Keep the check and append in one critical section.  Multiple async
+        # gateway paths can finish the same reply from different worker
+        # threads; only the first successful append owns this pair.
+        with _WRITTEN_REPLY_PAIRS_LOCK:
+            if dedup_key in _WRITTEN_REPLY_PAIRS:
+                return False
+
+            record = {
+                "schema_version": _SCHEMA_VERSION,
+                "recorded_at": datetime.now(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "receipt_type": "platform_accepted_reply",
+                "delivery_state": "PLATFORM_ACCEPTED",
+                "human_received_or_read_proven": False,
+                "platform": platform_text,
+                "inbound_message_id_hash": _composite_id_hash(
+                    platform=platform_text,
+                    chat_id=chat_text,
+                    direction="inbound",
+                    message_id=inbound_text,
+                ),
+                "outbound_message_id_hash": _composite_id_hash(
+                    platform=platform_text,
+                    chat_id=chat_text,
+                    direction="outbound",
+                    message_id=outbound_text,
+                ),
+                "reply_pair_hash": reply_pair_hash,
+            }
+            payload = (
+                json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+
+            log_dir = hermes_home / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = log_dir / RECEIPT_FILENAME
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                # One O_APPEND write keeps each compact JSONL receipt contiguous
+                # when multiple platform sessions complete concurrently.
+                written = os.write(fd, payload)
+                if written == len(payload):
+                    _WRITTEN_REPLY_PAIRS.add(dedup_key)
+                    return True
+                return False
+            finally:
+                os.close(fd)
     except Exception as exc:  # observability must never break a successful send
         logger.warning("Platform-accepted reply receipt write failed: %s", exc)
         return False
