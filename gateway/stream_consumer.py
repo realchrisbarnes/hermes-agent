@@ -213,6 +213,7 @@ class GatewayStreamConsumer:
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
         self._before_finalize_notified = False
+        self._accepted_reply_receipt_ids: set[str] = set()
 
     def _metadata_for_send(
         self,
@@ -880,6 +881,27 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
 
+    def _record_platform_accepted_result(self, result: Any) -> None:
+        """Record a new streamed reply without affecting delivery."""
+        if not getattr(result, "success", False):
+            return
+        outbound_id = str(getattr(result, "message_id", None) or "").strip()
+        if not outbound_id or outbound_id in self._accepted_reply_receipt_ids:
+            return
+        recorder = getattr(self.adapter, "_record_platform_accepted_reply", None)
+        if not callable(recorder):
+            return
+        try:
+            recorded = recorder(
+                chat_id=self.chat_id,
+                inbound_message_id=self._initial_reply_to_id,
+                result=result,
+            )
+            if recorded:
+                self._accepted_reply_receipt_ids.add(outbound_id)
+        except Exception as exc:
+            logger.warning("Stream reply receipt failed: %s", exc)
+
     # Strip MEDIA:<path> tags before display. Uses the shared anchored
     # MEDIA_TAG_CLEANUP_RE from gateway/platforms/base.py — only tags whose
     # path ends in a deliverable extension are removed, so an unknown-extension
@@ -923,6 +945,7 @@ class GatewayStreamConsumer:
                 metadata=self._metadata_for_send(final=final, expect_edits=True),
             )
             if result.success and result.message_id:
+                self._record_platform_accepted_result(result)
                 self._message_id = str(result.message_id)
                 self._track_preview_ids_from_result(result)
                 self._already_sent = True
@@ -1073,6 +1096,7 @@ class GatewayStreamConsumer:
                 return
             sent_any_chunk = True
             last_successful_chunk = chunk
+            self._record_platform_accepted_result(result)
             last_message_id = result.message_id or last_message_id
             # Each fallback chunk is a fresh platform message — notify
             # so any stale tool-progress bubble gets closed off.
@@ -1230,6 +1254,7 @@ class GatewayStreamConsumer:
                 metadata=self.metadata,
             )
             if result.success:
+                self._record_platform_accepted_result(result)
                 self._already_sent = True
         except Exception as e:
             logger.error("Segment-break tail flush error: %s", e)
@@ -1407,6 +1432,7 @@ class GatewayStreamConsumer:
             return False
         if not getattr(result, "success", False):
             return False
+        self._record_platform_accepted_result(result)
         # Adopt the new message id as the current message so subsequent
         # callers (e.g. overflow split loops, finalize retries) see a
         # consistent state.
@@ -1765,6 +1791,7 @@ class GatewayStreamConsumer:
                     ),
                 )
                 if result.success:
+                    self._record_platform_accepted_result(result)
                     if result.message_id:
                         self._message_id = result.message_id
                         # Track when the preview first became visible to

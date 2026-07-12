@@ -4070,6 +4070,32 @@ class BasePlatformAdapter(ABC):
             return response.text, int(ttl or 0)
         return response, 0
 
+    def _record_platform_accepted_reply(
+        self,
+        *,
+        chat_id: Any,
+        inbound_message_id: Any,
+        result: "SendResult",
+    ) -> bool:
+        """Best-effort redacted receipt for a successful inbound reply."""
+        try:
+            from gateway.delivery_receipts import record_platform_accepted_reply
+
+            return record_platform_accepted_reply(
+                platform=self.platform,
+                chat_id=chat_id,
+                inbound_message_id=inbound_message_id,
+                outbound_message_id=getattr(result, "message_id", None),
+                send_succeeded=bool(getattr(result, "success", False)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Platform-accepted reply receipt failed: %s",
+                self.name,
+                exc,
+            )
+            return False
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -4993,6 +5019,12 @@ class BasePlatformAdapter(ABC):
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
+                        if _tts_caption_delivered:
+                            self._record_platform_accepted_reply(
+                                chat_id=event.source.chat_id,
+                                inbound_message_id=event.message_id,
+                                result=tts_result,
+                            )
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -5010,6 +5042,11 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    self._record_platform_accepted_reply(
+                        chat_id=event.source.chat_id,
+                        inbound_message_id=event.message_id,
+                        result=result,
+                    )
 
                     # Schedule auto-deletion of system-notice replies.
                     # Detached so the handler returns immediately; errors
