@@ -100,8 +100,8 @@ _NON_MESSAGING_SESSION_SURFACES = frozenset(
 )
 
 
-def _session_is_messaging_surface() -> bool:
-    """Return whether this turn is delivered over a human messaging channel.
+def _session_is_messaging_surface(platform: str | None = None) -> bool:
+    """Return whether this turn is delivered over chat or scheduled delivery.
 
     The gateway binds the platform value (e.g. ``telegram``) to
     ``HERMES_SESSION_PLATFORM``; the CLI and TUI set ``HERMES_SESSION_SOURCE``
@@ -115,24 +115,28 @@ def _session_is_messaging_surface() -> bool:
     try:
         from gateway.session_context import get_session_env
 
-        platform = (
+        platform_env = (
             os.getenv("HERMES_PLATFORM")
             or get_session_env("HERMES_SESSION_PLATFORM", "")
         )
         source = get_session_env("HERMES_SESSION_SOURCE", "")
     except Exception:
-        platform = os.getenv("HERMES_PLATFORM", "") or os.environ.get(
+        platform_env = os.getenv("HERMES_PLATFORM", "") or os.environ.get(
             "HERMES_SESSION_PLATFORM", ""
         )
         source = os.environ.get("HERMES_SESSION_SOURCE", "")
-    for identity in (platform, source):
+    for identity in (platform, platform_env, source):
         identity = str(identity or "").strip().lower()
         if identity and identity not in _NON_MESSAGING_SESSION_SURFACES:
             return True
     return False
 
 
-def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
+def verify_on_stop_enabled(
+    config: dict[str, Any] | None = None,
+    *,
+    platform: str | None = None,
+) -> bool:
     """Return whether edit -> verify-before-finish behavior is enabled.
 
     Precedence: an explicit ``HERMES_VERIFY_ON_STOP`` env var wins, then an
@@ -165,9 +169,9 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
         if token in {"0", "false", "no", "off"}:
             return False
         if token == "auto":
-            return not _session_is_messaging_surface()
+            return not _session_is_messaging_surface(platform)
     # Missing or unrecognized value -> surface-aware "auto" default.
-    return not _session_is_messaging_surface()
+    return not _session_is_messaging_surface(platform)
 
 
 def _candidate_cwds(paths: Iterable[str]) -> list[Path]:

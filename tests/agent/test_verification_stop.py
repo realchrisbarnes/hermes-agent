@@ -68,6 +68,26 @@ def test_verify_on_stop_auto_sentinel_resolves_to_surface_default(clear_verify_e
     assert verify_on_stop_enabled({"agent": {"verify_on_stop": "auto"}}) is False
 
 
+def test_verify_on_stop_auto_off_for_explicit_cron_surface(clear_verify_env):
+    assert (
+        verify_on_stop_enabled(
+            {"agent": {"verify_on_stop": "auto"}},
+            platform="cron",
+        )
+        is False
+    )
+
+
+def test_verify_on_stop_explicit_true_still_enables_cron(clear_verify_env):
+    assert (
+        verify_on_stop_enabled(
+            {"agent": {"verify_on_stop": True}},
+            platform="cron",
+        )
+        is True
+    )
+
+
 def test_verify_on_stop_env_can_disable(clear_verify_env):
     clear_verify_env.setenv("HERMES_VERIFY_ON_STOP", "0")
     assert verify_on_stop_enabled({"agent": {"verify_on_stop": True}}) is False
