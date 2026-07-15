@@ -288,7 +288,7 @@ Plugins
   General Plugins
  → [✓] my-tool-plugin — Custom search tool
    [ ] webhook-notifier — Event hooks
-   [ ] disk-cleanup — Auto-cleanup of ephemeral files [bundled]
+   [ ] disk-cleanup — Read-only ephemeral-file inventory [bundled]
    [ ] observability/langfuse — Trace turns / LLM calls / tools to Langfuse [bundled]
 
   Provider Plugins

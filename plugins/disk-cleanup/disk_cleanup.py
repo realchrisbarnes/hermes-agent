@@ -1,19 +1,13 @@
-"""disk_cleanup — ephemeral file cleanup for Hermes Agent.
+"""Read-only ephemeral-file inventory for Hermes Agent.
 
 Library module wrapping the deterministic cleanup rules written by
 @LVT382009 in PR #12212. The plugin ``__init__.py`` wires these
-functions into ``post_tool_call`` and ``on_session_end`` hooks so
-tracking and cleanup happen automatically — the agent never needs to
-call a tool or remember a skill.
+functions into ``post_tool_call`` and ``on_session_end`` hooks. Tracking
+and review summaries remain available, while cleanup apply is
+``BLOCKED_PENDING_HARDENING``.
 
-Rules:
-  - test files    → delete immediately at task end (age >= 0)
-  - temp files    → delete after 7 days
-  - cron-output   → delete after 14 days
-  - empty dirs    → always delete (under HERMES_HOME)
-  - research      → keep 10 newest, prompt for older (deep only)
-  - chrome-profile→ prompt after 14 days (deep only)
-  - >500 MB files → prompt always (deep only)
+Historical thresholds are used only to rank review candidates. No category,
+age, prompt, confirmation, or operator request enables deletion.
 
 Scope: strictly HERMES_HOME and /tmp/hermes-*
 Never touches: ~/.hermes/logs/ or any system directory.
@@ -39,6 +33,8 @@ except Exception:  # pragma: no cover — plugin may load before constants resol
 
 
 logger = logging.getLogger(__name__)
+
+CLEANUP_APPLY_STATUS = "BLOCKED_PENDING_HARDENING"
 
 
 # ---------------------------------------------------------------------------
@@ -144,50 +140,6 @@ ALLOWED_CATEGORIES = {
     "chrome-profile", "cron-output", "other",
 }
 
-_EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
-    "logs", "memories", "sessions", "cron", "cronjobs",
-    "cache", "skills", "plugins", "disk-cleanup", "optional-skills",
-    "hermes-agent", "backups", "profiles", ".worktrees",
-})
-
-_EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
-    ".git", "node_modules", "venv", ".venv",
-    "site-packages", "__pycache__",
-})
-
-
-# Paths under $HERMES_HOME that must NEVER be deleted by quick(),
-# regardless of what the stored category says.  This is a defense-in-depth
-# guard against stale tracked.json entries from before #34840.
-_PROTECTED_CRON_PATHS: set[str] = set()
-
-
-def _is_protected_cron_path(p: Path) -> bool:
-    """Return True if *p* is a cron control-plane file/directory that must
-    never be deleted.
-
-    This matches, by EXACT path only, the ``cron/`` directory itself, known
-    control-plane files (``jobs.json``, ``.tick.lock``), and the ``output/``
-    root directory. It does NOT (and must not be "simplified" to) blanket-match
-    everything under ``cron/output/`` — those run artifacts are disposable and
-    are cleaned by retention policy; only the ``output/`` root itself is
-    protected, because deleting it wholesale erases every job's retained run
-    history at once.
-    """
-    # Lazily build the set once per process so HERMES_HOME is resolved
-    # exactly once.
-    if not _PROTECTED_CRON_PATHS:
-        hermes_home = get_hermes_home()
-        for parent in ("cron", "cronjobs"):
-            base = hermes_home / parent
-            _PROTECTED_CRON_PATHS.add(str(base))
-            _PROTECTED_CRON_PATHS.add(str(base / "output"))
-            _PROTECTED_CRON_PATHS.add(str(base / "jobs.json"))
-            _PROTECTED_CRON_PATHS.add(str(base / ".tick.lock"))
-    resolved = str(p.resolve())
-    return resolved in _PROTECTED_CRON_PATHS
-
-
 def fmt_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
@@ -254,7 +206,7 @@ def forget(path_str: str) -> int:
 # ---------------------------------------------------------------------------
 
 def dry_run() -> Tuple[List[Dict], List[Dict]]:
-    """Return (auto_delete_list, needs_prompt_list) without touching files."""
+    """Return categorized review candidates without touching files."""
     tracked = load_tracked()
     now = datetime.now(timezone.utc)
 
@@ -294,201 +246,52 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
 
 
 # ---------------------------------------------------------------------------
-# Quick cleanup
+# Quick review (historical command name retained for compatibility)
 # ---------------------------------------------------------------------------
 
 def quick() -> Dict[str, Any]:
-    """Safe deterministic cleanup — no prompts.
+    """Return a read-only review summary; cleanup apply is policy-paused.
 
     Returns: ``{"deleted": N, "empty_dirs": N, "freed": bytes,
                "errors": [str, ...]}``.
     """
-    tracked = load_tracked()
-    now = datetime.now(timezone.utc)
-    deleted = 0
-    freed = 0
-    new_tracked: List[Dict] = []
-    errors: List[str] = []
-
-    for item in tracked:
-        p = Path(item["path"])
-        cat = item["category"]
-
-        if not p.exists():
-            _log(f"STALE: {p} (removed from tracking)")
-            continue
-
-        age = (now - datetime.fromisoformat(item["timestamp"])).days
-
-        # ---- stale-state migration (fixes #37721) ----
-        # Old tracked.json entries may carry a "cron-output" category for
-        # paths that are NOT under cron/output/ (e.g. cron/jobs.json).
-        # guess_category() was fixed in #34840, but existing entries are
-        # never re-validated.  Re-classify here so stale entries for cron
-        # control-plane state are not deleted.
-        if cat == "cron-output":
-            re_cat = guess_category(p)
-            if re_cat != "cron-output":
-                _log(
-                    f"SKIP stale cron-output entry: {p} "
-                    f"(re-classified as {re_cat!r})"
-                )
-                # Drop the stale entry — it was misclassified.
-                continue
-
-        # Hard safety net: never delete cron control-plane state even if
-        # the category somehow slipped through re-validation above.
-        if _is_protected_cron_path(p):
-            _log(f"SKIP protected cron path: {p}")
-            continue
-
-        should_delete = (
-            cat == "test"
-            or (cat == "temp" and age > 7)
-            or (cat == "cron-output" and age > 14)
-        )
-
-        if should_delete:
-            try:
-                if p.is_file():
-                    p.unlink()
-                elif p.is_dir():
-                    shutil.rmtree(p)
-                freed += item["size"]
-                deleted += 1
-                _log(f"DELETED: {p} ({cat}, {fmt_size(item['size'])})")
-            except OSError as e:
-                _log(f"ERROR deleting {p}: {e}")
-                errors.append(f"{p}: {e}")
-                new_tracked.append(item)
-        else:
-            new_tracked.append(item)
-
-    # Remove empty dirs under HERMES_HOME, but never recurse into known
-    # durable state trees.  Some installs place the Hermes checkout, venv,
-    # and desktop build under HERMES_HOME; a full rglob over that tree can
-    # stall the gateway event loop for minutes.
-    hermes_home = get_hermes_home()
-    empty_removed = 0
-    sweep_stack: List[Tuple[Path, bool]] = []
-    try:
-        for top in hermes_home.iterdir():
-            if (
-                top.is_dir()
-                and not top.is_symlink()
-                and top.name not in _EMPTY_DIR_PROTECTED_TOP_LEVEL
-                and top.name not in _EMPTY_DIR_SWEEP_PRUNE_DIRS
-            ):
-                sweep_stack.append((top, False))
-    except OSError:
-        sweep_stack = []
-
-    while sweep_stack:
-        dirpath, visited = sweep_stack.pop()
-        if visited:
-            try:
-                if not any(dirpath.iterdir()):
-                    dirpath.rmdir()
-                    empty_removed += 1
-                    _log(f"DELETED: {dirpath} (empty dir)")
-            except OSError:
-                pass
-            continue
-
-        sweep_stack.append((dirpath, True))
-        try:
-            for child in dirpath.iterdir():
-                if (
-                    child.is_dir()
-                    and not child.is_symlink()
-                    and child.name not in _EMPTY_DIR_SWEEP_PRUNE_DIRS
-                ):
-                    sweep_stack.append((child, False))
-        except OSError:
-            pass
-
-    save_tracked(new_tracked)
+    auto, prompt = dry_run()
     _log(
-        f"QUICK_SUMMARY: {deleted} files, {empty_removed} dirs, "
-        f"{fmt_size(freed)}"
+        f"BLOCKED: cleanup apply is {CLEANUP_APPLY_STATUS}; "
+        f"review_candidates={len(auto) + len(prompt)}"
     )
     return {
-        "deleted": deleted,
-        "empty_dirs": empty_removed,
-        "freed": freed,
-        "errors": errors,
+        "deleted": 0,
+        "empty_dirs": 0,
+        "freed": 0,
+        "errors": [],
+        "apply_status": CLEANUP_APPLY_STATUS,
+        "review_candidates": len(auto) + len(prompt),
     }
 
 
 # ---------------------------------------------------------------------------
-# Deep cleanup (interactive — not called from plugin hooks)
+# Deep review (historical command name retained for compatibility)
 # ---------------------------------------------------------------------------
 
 def deep(
     confirm: Optional[callable] = None,
 ) -> Dict[str, Any]:
-    """Deep cleanup.
+    """Return a read-only summary; deep cleanup is policy-paused.
 
-    Runs :func:`quick` first, then asks the *confirm* callable for each
-    risky item (research > 30d beyond 10 newest, chrome-profile > 14d,
-    any file > 500 MB).  *confirm(item)* must return True to delete.
+    Runs :func:`quick` first. The *confirm* callable is ignored while apply
+    remains policy-paused.
 
     Returns: ``{"quick": {...}, "deep_deleted": N, "deep_freed": bytes}``.
     """
+    del confirm
     quick_result = quick()
-
-    if confirm is None:
-        # No interactive confirmer — deep stops after the quick pass.
-        return {"quick": quick_result, "deep_deleted": 0, "deep_freed": 0}
-
-    tracked = load_tracked()
-    now = datetime.now(timezone.utc)
-    research, chrome, large = [], [], []
-
-    for item in tracked:
-        p = Path(item["path"])
-        if not p.exists():
-            continue
-        age = (now - datetime.fromisoformat(item["timestamp"])).days
-        cat = item["category"]
-
-        if cat == "research" and age > 30:
-            research.append(item)
-        elif cat == "chrome-profile" and age > 14:
-            chrome.append(item)
-        elif item["size"] > 500 * 1024 * 1024:
-            large.append(item)
-
-    research.sort(key=lambda x: x["timestamp"], reverse=True)
-    old_research = research[10:]
-
-    freed, count = 0, 0
-    to_remove: List[Dict] = []
-
-    for group in (old_research, chrome, large):
-        for item in group:
-            if confirm(item):
-                try:
-                    p = Path(item["path"])
-                    if p.is_file():
-                        p.unlink()
-                    elif p.is_dir():
-                        shutil.rmtree(p)
-                    to_remove.append(item)
-                    freed += item["size"]
-                    count += 1
-                    _log(
-                        f"DELETED: {p} ({item['category']}, "
-                        f"{fmt_size(item['size'])})"
-                    )
-                except OSError as e:
-                    _log(f"ERROR deleting {item['path']}: {e}")
-
-    if to_remove:
-        remove_paths = {i["path"] for i in to_remove}
-        save_tracked([i for i in tracked if i["path"] not in remove_paths])
-
-    return {"quick": quick_result, "deep_deleted": count, "deep_freed": freed}
+    return {
+        "quick": quick_result,
+        "deep_deleted": 0,
+        "deep_freed": 0,
+        "apply_status": CLEANUP_APPLY_STATUS,
+    }
 
 
 # ---------------------------------------------------------------------------

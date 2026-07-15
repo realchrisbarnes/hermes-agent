@@ -2,7 +2,7 @@
 sidebar_position: 12
 sidebar_label: "内置插件"
 title: "内置插件"
-description: "随 Hermes Agent 附带并通过生命周期 hook 自动运行的插件——disk-cleanup 等"
+description: "随 Hermes Agent 附带的插件，包括策略暂停的 disk-cleanup 只读清单"
 ---
 
 # 内置插件
@@ -55,7 +55,7 @@ hermes plugins disable disk-cleanup
 
 | 插件 | 类型 | 用途 |
 |---|---|---|
-| `disk-cleanup` | hook + 斜杠命令 | 自动追踪临时文件并在会话结束时清理 |
+| `disk-cleanup` | hook + 斜杠命令 | 自动追踪临时文件以供只读审查；清理执行已暂停 |
 | `observability/langfuse` | hook | 将轮次 / LLM 调用 / 工具追踪到 [Langfuse](https://langfuse.com) |
 | `spotify` | 后端（7 个工具） | 原生 Spotify 播放、队列、搜索、播放列表、专辑、曲库 |
 | `google_meet` | 独立插件 | 加入 Meet 通话、实时字幕转录、可选实时双工音频 |
@@ -69,34 +69,35 @@ hermes plugins disable disk-cleanup
 
 ### disk-cleanup
 
-自动追踪并删除会话期间创建的临时文件——测试脚本、临时输出、cron 日志、过期的 Chrome 配置文件——无需 agent 记住调用工具。
+自动追踪会话期间创建的临时文件——测试脚本、临时输出、cron 日志、过期的 Chrome 配置文件——以供只读审查。清理执行状态为 `BLOCKED_PENDING_HARDENING`。
 
 **工作原理：**
 
 | Hook | 行为 |
 |---|---|
 | `post_tool_call` | 当 `write_file` / `terminal` / `patch` 在 `HERMES_HOME` 或 `/tmp/hermes-*` 内创建匹配 `test_*`、`tmp_*` 或 `*.test.*` 的文件时，静默追踪为 `test` / `temp` / `cron-output`。 |
-| `on_session_end` | 如果本轮中有任何测试文件被自动追踪，则执行安全的 `quick` 清理并记录一行摘要。否则保持静默。 |
+| `on_session_end` | 如果本轮中有任何测试文件被自动追踪，则记录只读审查摘要。否则保持静默。 |
 
-**删除规则：**
+**审查分类（不删除）：**
 
 | 类别 | 阈值 | 确认 |
 |---|---|---|
-| `test` | 每次会话结束 | 从不 |
-| `temp` | 追踪后超过 7 天 | 从不 |
-| `cron-output` | 追踪后超过 14 天 | 从不 |
-| HERMES_HOME 下的空目录 | 始终 | 从不 |
-| `research` | 超过 30 天，且超出最新 10 个 | 始终（仅 deep 模式） |
-| `chrome-profile` | 追踪后超过 14 天 | 始终（仅 deep 模式） |
-| 超过 500 MB 的文件 | 从不自动删除 | 始终（仅 deep 模式） |
+| `test` | 每次会话结束 | 仅审查 |
+| `temp` | 追踪后超过 7 天 | 仅审查 |
+| `cron-output` | 追踪后超过 14 天 | 仅审查 |
+| `research` | 超过 30 天 | 仅审查 |
+| `chrome-profile` | 追踪后超过 14 天 | 仅审查 |
+| 超过 500 MB 的文件 | 大小阈值 | 仅审查 |
+
+任何类别、阈值、确认回调或斜杠命令都不能启用删除。
 
 **斜杠命令** — `/disk-cleanup` 在 CLI 和 gateway 会话中均可用：
 
 ```
 /disk-cleanup status                     # 分类明细 + 最大的 10 个文件
 /disk-cleanup dry-run                    # 预览，不实际删除
-/disk-cleanup quick                      # 立即执行安全清理
-/disk-cleanup deep                       # quick + 列出需要确认的项目
+/disk-cleanup quick                      # 已阻止；仅报告审查数量
+/disk-cleanup deep                       # 已阻止；仅报告审查候选项
 /disk-cleanup track <path> <category>    # 手动追踪
 /disk-cleanup forget <path>              # 停止追踪（不删除）
 ```
@@ -107,9 +108,9 @@ hermes plugins disable disk-cleanup
 |---|---|
 | `tracked.json` | 已追踪路径，包含类别、大小和时间戳 |
 | `tracked.json.bak` | 上述文件的原子写入备份 |
-| `cleanup.log` | 每次追踪 / 跳过 / 拒绝 / 删除操作的仅追加审计日志 |
+| `cleanup.log` | 追踪 / 跳过 / 拒绝 / 策略状态事件的仅追加审计日志 |
 
-**安全性** — 清理操作仅涉及 `HERMES_HOME` 或 `/tmp/hermes-*` 下的路径。Windows 挂载点（`/mnt/c/...`）会被拒绝。已知的顶级状态目录（`logs/`、`memories/`、`sessions/`、`cron/`、`cache/`、`skills/`、`plugins/`、`disk-cleanup/` 本身）即使为空也不会被删除——全新安装不会在第一次会话结束时被清空。
+**安全性** — 路径追踪仅限于 `HERMES_HOME` 或 `/tmp/hermes-*`；Windows 挂载点（`/mnt/c/...`）会被拒绝。插件不包含文件或目录删除原语，`quick`、`deep` 和会话结束 hook 只报告 `BLOCKED_PENDING_HARDENING`，不会删除数据。
 
 **启用：** `hermes plugins enable disk-cleanup`（或在 `hermes plugins` 中勾选复选框）。
 

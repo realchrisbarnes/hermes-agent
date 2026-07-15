@@ -2,7 +2,7 @@
 sidebar_position: 12
 sidebar_label: "Built-in Plugins"
 title: "Built-in Plugins"
-description: "Plugins shipped with Hermes Agent that run automatically via lifecycle hooks — disk-cleanup and friends"
+description: "Plugins shipped with Hermes Agent, including the policy-paused disk-cleanup inventory"
 ---
 
 # Built-in Plugins
@@ -55,7 +55,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 
 | Plugin | Kind | Purpose |
 |---|---|---|
-| `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
+| `disk-cleanup` | hooks + slash command | Auto-track ephemeral files for read-only review; cleanup apply is policy-paused |
 | `security-guidance` | hooks | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
 | `observability/nemo_relay` | hooks | Relay observability events (turns / LLM calls / tools) to an NVIDIA NeMo endpoint |
@@ -72,34 +72,35 @@ Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engi
 
 ### disk-cleanup
 
-Auto-tracks and removes ephemeral files created during sessions — test scripts, temp outputs, cron logs, stale chrome profiles — without requiring the agent to remember to call a tool.
+Auto-tracks ephemeral files created during sessions — test scripts, temp outputs, cron logs, stale chrome profiles — for read-only review. Cleanup apply is `BLOCKED_PENDING_HARDENING`.
 
 **How it works:**
 
 | Hook | Behaviour |
 |---|---|
 | `post_tool_call` | When `write_file` / `terminal` / `patch` creates a file matching `test_*`, `tmp_*`, or `*.test.*` inside `HERMES_HOME` or `/tmp/hermes-*`, track it silently as `test` / `temp` / `cron-output`. |
-| `on_session_end` | If any test files were auto-tracked during the turn, run the safe `quick` cleanup and log a one-line summary. Stays silent otherwise. |
+| `on_session_end` | If any test files were auto-tracked during the turn, record a read-only review summary. Stays silent otherwise. |
 
-**Deletion rules:**
+**Review classifications (no deletion):**
 
 | Category | Threshold | Confirmation |
 |---|---|---|
-| `test` | every session end | Never |
-| `temp` | >7 days since tracked | Never |
-| `cron-output` | >14 days since tracked | Never |
-| empty dirs under HERMES_HOME | always | Never |
-| `research` | >30 days, beyond 10 newest | Always (deep only) |
-| `chrome-profile` | >14 days since tracked | Always (deep only) |
-| files >500 MB | never auto | Always (deep only) |
+| `test` | every session end | Review only |
+| `temp` | >7 days since tracked | Review only |
+| `cron-output` | >14 days since tracked | Review only |
+| `research` | >30 days | Review only |
+| `chrome-profile` | >14 days since tracked | Review only |
+| files >500 MB | size threshold | Review only |
+
+No category, threshold, confirmation callback, or slash command enables deletion.
 
 **Slash command** — `/disk-cleanup` available in both CLI and gateway sessions:
 
 ```
 /disk-cleanup status                     # breakdown + top-10 largest
 /disk-cleanup dry-run                    # preview without deleting
-/disk-cleanup quick                      # run safe cleanup now
-/disk-cleanup deep                       # quick + list items needing confirmation
+/disk-cleanup quick                      # blocked; report review count only
+/disk-cleanup deep                       # blocked; report review candidates only
 /disk-cleanup track <path> <category>    # manual tracking
 /disk-cleanup forget <path>              # stop tracking (does not delete)
 ```
@@ -110,9 +111,9 @@ Auto-tracks and removes ephemeral files created during sessions — test scripts
 |---|---|
 | `tracked.json` | Tracked paths with category, size, and timestamp |
 | `tracked.json.bak` | Atomic-write backup of the above |
-| `cleanup.log` | Append-only audit trail of every track / skip / reject / delete |
+| `cleanup.log` | Append-only audit trail of track / skip / reject / policy status events |
 
-**Safety** — cleanup only ever touches paths under `HERMES_HOME` or `/tmp/hermes-*`. Windows mounts (`/mnt/c/...`) are rejected. Well-known top-level state dirs (`logs/`, `memories/`, `sessions/`, `cron/`, `cache/`, `skills/`, `plugins/`, `disk-cleanup/` itself) are never removed even when empty — a fresh install does not get gutted on first session end.
+**Safety** — path tracking is limited to `HERMES_HOME` or `/tmp/hermes-*`; Windows mounts (`/mnt/c/...`) are rejected. The plugin contains no file or directory deletion primitives, and `quick`, `deep`, and session-end hooks report `BLOCKED_PENDING_HARDENING` without deleting data.
 
 **Enabling:** `hermes plugins enable disk-cleanup` (or check the box in `hermes plugins`).
 

@@ -1,4 +1,4 @@
-"""disk-cleanup plugin — auto-cleanup of ephemeral Hermes session files.
+"""disk-cleanup plugin — read-only ephemeral-file inventory.
 
 Wires three behaviours:
 
@@ -7,9 +7,8 @@ Wires three behaviours:
    under ``HERMES_HOME`` and tracks them silently.  Zero agent
    compliance required.
 
-2. ``on_session_end`` hook — when any test files were auto-tracked
-   during the just-finished turn, runs :func:`disk_cleanup.quick` and
-   logs a single line to ``$HERMES_HOME/disk-cleanup/cleanup.log``.
+2. ``on_session_end`` hook — when files were tracked during the turn,
+   records a policy-paused review summary without deleting anything.
 
 3. ``/disk-cleanup`` slash command — manual ``status``, ``dry-run``,
    ``quick``, ``deep``, ``track``, ``forget``.
@@ -158,14 +157,14 @@ def _on_session_end(
     interrupted: bool = False,
     **_: Any,
 ) -> None:
-    """Run quick cleanup if any test files were tracked during this turn."""
+    """Record a read-only review summary when files were tracked."""
     # Drain both task-level and session-level buckets.  In practice only one
     # is populated per turn; the other is empty.
     drained_session = _drain("", session_id)
     # Also drain any task-scoped buckets that happen to exist.  This is a
     # cheap sweep: if an agent spawned subagents (each with their own
     # task_id) they'll have recorded into separate buckets; we want to
-    # cleanup them all at session end.
+    # summarize them all at session end.
     with _lock:
         task_buckets = list(_recent_test_tracks.keys())
     for key in task_buckets:
@@ -178,14 +177,13 @@ def _on_session_end(
     try:
         summary = dg.quick()
     except Exception as exc:
-        logger.debug("disk-cleanup quick cleanup failed: %s", exc)
+        logger.debug("disk-cleanup review summary failed: %s", exc)
         return
 
-    if summary["deleted"] or summary["empty_dirs"]:
-        dg._log(
-            f"AUTO_QUICK (session_end): deleted={summary['deleted']} "
-            f"dirs={summary['empty_dirs']} freed={dg.fmt_size(summary['freed'])}"
-        )
+    dg._log(
+        f"SESSION_REVIEW: apply={summary['apply_status']} "
+        f"candidates={summary['review_candidates']} deleted=0 dirs=0 freed=0"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -193,24 +191,29 @@ def _on_session_end(
 # ---------------------------------------------------------------------------
 
 _HELP_TEXT = """\
-/disk-cleanup — ephemeral-file cleanup
+/disk-cleanup — read-only ephemeral-file inventory
 
 Subcommands:
   status                     Per-category breakdown + top-10 largest
-  dry-run                    Preview what quick/deep would delete
-  quick                      Run safe cleanup now (no prompts)
-  deep                       Run quick, then list items that need prompts
+  dry-run                    Preview review candidates without deleting
+  quick                      Report BLOCKED_PENDING_HARDENING; no deletion
+  deep                       Report review candidates; no deletion
   track <path> <category>    Manually add a path to tracking
   forget <path>              Stop tracking a path (does not delete)
 
 Categories: temp | test | research | download | chrome-profile | cron-output | other
 
 All operations are scoped to HERMES_HOME and /tmp/hermes-*.
-Test files are auto-tracked on write_file / terminal and auto-cleaned at session end.
+Files may be tracked on write_file / terminal, but cleanup apply is policy-paused.
 """
 
 
 def _fmt_summary(summary: Dict[str, Any]) -> str:
+    if summary.get("apply_status") == dg.CLEANUP_APPLY_STATUS:
+        return (
+            f"[disk-cleanup] {dg.CLEANUP_APPLY_STATUS}: no files or directories "
+            f"were deleted; {summary.get('review_candidates', 0)} review candidate(s)."
+        )
     base = (
         f"[disk-cleanup] Cleaned {summary['deleted']} files + "
         f"{summary['empty_dirs']} empty dirs, freed {dg.fmt_size(summary['freed'])}."
@@ -268,8 +271,8 @@ def _handle_slash(raw_args: str) -> Optional[str]:
             for item in prompt_items:
                 lines.append(f"  [{item['category']}] {item['path']}")
             lines.append(
-                "\nRun `/disk-cleanup forget <path>` to skip, or delete "
-                "manually via terminal."
+                "\nCleanup remains policy-paused. Review only; do not delete "
+                "through this plugin."
             )
         return "\n".join(lines)
 
@@ -312,5 +315,5 @@ def register(ctx) -> None:
     ctx.register_command(
         "disk-cleanup",
         handler=_handle_slash,
-        description="Track and clean up ephemeral Hermes session files.",
+        description="Track and review ephemeral Hermes session files; cleanup is policy-paused.",
     )

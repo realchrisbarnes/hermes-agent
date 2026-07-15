@@ -1,7 +1,7 @@
-# disk-cleanup
+# disk-cleanup (read-only)
 
-Auto-tracks and cleans up ephemeral files created during Hermes Agent
-sessions — test scripts, temp outputs, cron logs, stale chrome profiles.
+Tracks and inventories ephemeral files created during Hermes Agent sessions
+— test scripts, temp outputs, cron logs, and stale chrome profiles.
 Scoped strictly to `$HERMES_HOME` and `/tmp/hermes-*`.
 
 Originally contributed by [@LVT382009](https://github.com/LVT382009) as a
@@ -14,32 +14,34 @@ never needs to remember to call a tool.
 | Hook | Behaviour |
 |---|---|
 | `post_tool_call` | When `write_file` / `terminal` / `patch` creates a file matching `test_*`, `tmp_*`, or `*.test.*` inside `HERMES_HOME`, track it silently as `test` / `temp` / `cron-output`. |
-| `on_session_end` | If any test files were auto-tracked during this turn, run `quick` cleanup (no prompts). |
+| `on_session_end` | If files were tracked, record a policy-paused review summary; delete nothing. |
 
-Deletion rules (same as the original PR):
+Historical review thresholds (not deletion authorization):
 
-| Category | Threshold | Confirmation |
+| Category | Review threshold | Cleanup status |
 |---|---|---|
-| `test` | every session end | Never |
-| `temp` | >7 days since tracked | Never |
-| `cron-output` | >14 days since tracked | Never |
-| empty dirs under HERMES_HOME | always | Never |
-| `research` | >30 days, beyond 10 newest | Always (deep only) |
-| `chrome-profile` | >14 days since tracked | Always (deep only) |
-| files >500 MB | never auto | Always (deep only) |
+| `test` | every session end | Blocked |
+| `temp` | >7 days since tracked | Blocked |
+| `cron-output` | >14 days since tracked | Blocked |
+| empty dirs under HERMES_HOME | always | Blocked |
+| `research` | >30 days, beyond 10 newest | Blocked |
+| `chrome-profile` | >14 days since tracked | Blocked |
+| files >500 MB | always review | Blocked |
 
 ## Slash command
 
 ```
 /disk-cleanup status                     # breakdown + top-10 largest
 /disk-cleanup dry-run                    # preview without deleting
-/disk-cleanup quick                      # run safe cleanup now
-/disk-cleanup deep                       # quick + list items needing prompt
+/disk-cleanup quick                      # BLOCKED_PENDING_HARDENING; no deletion
+/disk-cleanup deep                       # review candidates only; no deletion
 /disk-cleanup track <path> <category>    # manual tracking
 /disk-cleanup forget <path>              # stop tracking
 ```
 
 ## Safety
+
+- Cleanup apply is `BLOCKED_PENDING_HARDENING`; approval alone cannot enable it
 
 - `is_safe_path()` rejects anything outside `HERMES_HOME` or `/tmp/hermes-*`
 - Windows mounts (`/mnt/c` etc.) are rejected

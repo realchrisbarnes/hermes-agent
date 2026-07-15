@@ -2,11 +2,11 @@
 
 Covers the bundled plugin at ``plugins/disk-cleanup/``:
 
-  * ``disk_cleanup`` library: track / forget / dry_run / quick / status,
+  * ``disk_cleanup`` library: track / forget / dry_run / blocked quick / status,
     ``is_safe_path`` and ``guess_category`` filtering.
   * Plugin ``__init__``: ``post_tool_call`` hook auto-tracks files created
-    by ``write_file`` / ``terminal``; ``on_session_end`` hook runs quick
-    cleanup when anything was tracked during the turn.
+    by ``write_file`` / ``terminal``; ``on_session_end`` records a read-only
+    review when anything was tracked during the turn.
   * Slash command handler: status / dry-run / quick / track / forget /
     unknown subcommand behaviours.
   * Bundled-plugin discovery via ``PluginManager.discover_and_load``.
@@ -68,6 +68,14 @@ def _load_plugin_init():
     sys.modules["hermes_plugins.disk_cleanup"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def test_library_contains_no_file_or_directory_deletion_primitives():
+    """Policy pause removes latent delete code, not only its call paths."""
+    repo_root = Path(__file__).resolve().parents[2]
+    source = (repo_root / "plugins" / "disk-cleanup" / "disk_cleanup.py").read_text()
+    for primitive in ("shutil.rmtree(", ".unlink(", ".rmdir(", "os.remove("):
+        assert primitive not in source
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +217,9 @@ class TestStaleCronEntryMigration:
         summary = dg.quick()
         assert summary["deleted"] == 0, "cron/jobs.json must not be deleted"
         assert jobs_json.exists(), "jobs.json must still exist"
-        # The stale entry should have been dropped from tracking.
+        # Policy-paused review does not mutate tracking state.
         remaining = json.loads(tracked_file.read_text())
-        assert len(remaining) == 0
+        assert len(remaining) == 1
 
     def test_quick_skips_stale_cron_output_for_cron_dir(self, _isolate_env):
         """Stale entry for the cron/ directory itself must not be deleted."""
@@ -303,8 +311,8 @@ class TestStaleCronEntryMigration:
         assert len(auto) == 0, "stale cron-output for jobs.json must not appear"
         assert len(prompt) == 0
 
-    def test_legitimate_cron_output_still_deleted(self, _isolate_env):
-        """A valid cron-output entry under cron/output/ must still be deleted."""
+    def test_legitimate_cron_output_is_review_only(self, _isolate_env):
+        """Even valid old cron output is retained while cleanup is paused."""
         dg = _load_lib()
         output_dir = _isolate_env / "cron" / "output" / "job_1"
         output_dir.mkdir(parents=True)
@@ -325,19 +333,33 @@ class TestStaleCronEntryMigration:
         }]))
 
         summary = dg.quick()
-        assert summary["deleted"] == 1, "valid old cron-output should be deleted"
-        assert not run_md.exists()
+        assert summary["deleted"] == 0
+        assert summary["apply_status"] == "BLOCKED_PENDING_HARDENING"
+        assert run_md.exists()
 
 
 class TestTrackForgetQuick:
-    def test_track_then_quick_deletes_test(self, _isolate_env):
+    def test_track_then_quick_retains_test(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "test_a.py"
         p.write_text("x")
         assert dg.track(str(p), "test", silent=True) is True
         summary = dg.quick()
-        assert summary["deleted"] == 1
-        assert not p.exists()
+        assert summary["deleted"] == 0
+        assert summary["apply_status"] == "BLOCKED_PENDING_HARDENING"
+        assert p.exists()
+
+    def test_deep_confirmation_cannot_enable_deletion(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "test_deep.py"
+        p.write_text("x")
+        dg.track(str(p), "test", silent=True)
+
+        summary = dg.deep(confirm=lambda _item: True)
+
+        assert summary["apply_status"] == "BLOCKED_PENDING_HARDENING"
+        assert summary["deep_deleted"] == 0
+        assert p.exists()
 
     def test_track_dedup(self, _isolate_env):
         dg = _load_lib()
@@ -404,14 +426,14 @@ class TestTrackForgetQuick:
 
         assert protected_empty.exists()
 
-    def test_quick_removes_empty_dirs_in_managed_subtrees(self, _isolate_env):
+    def test_quick_retains_empty_dirs_in_managed_subtrees(self, _isolate_env):
         dg = _load_lib()
         managed_empty = _isolate_env / "scratch" / "nested" / "empty"
         managed_empty.mkdir(parents=True)
 
         dg.quick()
 
-        assert not (_isolate_env / "scratch").exists()
+        assert (_isolate_env / "scratch").exists()
 
 
 class TestStatus:
@@ -509,7 +531,7 @@ class TestPostToolCallHook:
 
 
 class TestOnSessionEndHook:
-    def test_runs_quick_when_test_files_tracked(self, _isolate_env):
+    def test_session_end_retains_tracked_test_files(self, _isolate_env):
         pi = _load_plugin_init()
         p = _isolate_env / "test_cleanup.py"
         p.write_text("x")
@@ -521,7 +543,7 @@ class TestOnSessionEndHook:
         )
         assert p.exists()
         pi._on_session_end(session_id="s1", completed=True, interrupted=False)
-        assert not p.exists(), "test file should be auto-deleted"
+        assert p.exists(), "policy-paused session end must retain the file"
 
     def test_noop_when_no_test_tracked(self, _isolate_env):
         pi = _load_plugin_init()
@@ -576,7 +598,8 @@ class TestSlashCommand:
     def test_quick_on_empty(self, _isolate_env):
         pi = _load_plugin_init()
         out = pi._handle_slash("quick")
-        assert "Cleaned 0 files" in out
+        assert "BLOCKED_PENDING_HARDENING" in out
+        assert "no files or directories were deleted" in out
 
 
 # ---------------------------------------------------------------------------
