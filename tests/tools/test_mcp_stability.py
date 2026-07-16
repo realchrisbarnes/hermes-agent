@@ -427,7 +427,11 @@ class TestStdioPgroupReaping:
             [sys.executable, str(parent_script)],
             start_new_session=True,
         )
-        parent_pgid = os.getpgid(parent.pid)
+        # start_new_session=True makes the child the new session and process
+        # group leader, so its PGID is deterministically its PID. Asking the
+        # kernel after Popen races the intentionally short-lived parent and can
+        # raise ProcessLookupError under parallel suite load.
+        parent_pgid = parent.pid
         # Wait for parent to exit and grandchild to spin up.
         parent.wait(timeout=5)
         deadline = _time.time() + 5

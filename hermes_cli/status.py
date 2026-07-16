@@ -24,6 +24,7 @@ from hermes_cli.runtime_provider import resolve_requested_provider
 from hermes_constants import OPENROUTER_MODELS_URL
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
+
 def check_mark(ok: bool) -> str:
     if ok:
         return color("✓", Colors.GREEN)
@@ -105,6 +106,8 @@ from hermes_constants import is_termux as _is_termux
 def show_status(args):
     """Show status of all Hermes Agent components."""
     deep = getattr(args, 'deep', False)
+    refresh_auth = bool(getattr(args, "refresh_auth", False))
+    snapshot_only = not refresh_auth
 
     print()
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
@@ -120,15 +123,21 @@ def show_status(args):
     print(f"  Python:       {sys.version.split()[0]}")
 
     env_path = get_env_path()
-    print(f"  .env file:    {check_mark(env_path.exists())} {'exists' if env_path.exists() else 'not found'}")
+    if snapshot_only:
+        print("  .env file:    ? NOT INSPECTED")
+    else:
+        print(f"  .env file:    {check_mark(env_path.exists())} {'exists' if env_path.exists() else 'not found'}")
 
-    try:
-        config = load_config()
-    except Exception:
+    if snapshot_only:
         config = {}
+    else:
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
 
-    print(f"  Model:        {_configured_model_label(config)}")
-    print(f"  Provider:     {_effective_provider_label()}")
+    print(f"  Model:        {'NOT INSPECTED' if snapshot_only else _configured_model_label(config)}")
+    print(f"  Provider:     {'unknown (auth not inspected)' if snapshot_only else _effective_provider_label()}")
 
     # =========================================================================
     # API Keys
@@ -175,15 +184,21 @@ def show_status(args):
         # so we don't print two "Anthropic" rows.
         if name == "Anthropic":
             continue
-        value = _resolve_env(env_ref)
-        has_key = bool(value)
-        display = redact_key(value)
-        print(f"  {name:<12}  {check_mark(has_key)} {display}")
+        if snapshot_only:
+            print(f"  {name:<12}  ? NOT INSPECTED")
+        else:
+            value = _resolve_env(env_ref)
+            has_key = bool(value)
+            display = redact_key(value)
+            print(f"  {name:<12}  {check_mark(has_key)} {display}")
 
-    from hermes_cli.auth import get_anthropic_key
-    anthropic_value = get_anthropic_key()
-    anthropic_display = redact_key(anthropic_value)
-    print(f"  {'Anthropic':<12}  {check_mark(bool(anthropic_value))} {anthropic_display}")
+    if snapshot_only:
+        print(f"  {'Anthropic':<12}  ? NOT INSPECTED")
+    else:
+        from hermes_cli.auth import get_anthropic_key
+        anthropic_value = get_anthropic_key()
+        anthropic_display = redact_key(anthropic_value)
+        print(f"  {'Anthropic':<12}  {check_mark(bool(anthropic_value))} {anthropic_display}")
 
     # =========================================================================
     # Auth Providers (OAuth)
@@ -192,6 +207,8 @@ def show_status(args):
     print(color("◆ Auth Providers", Colors.CYAN, Colors.BOLD))
 
     try:
+        if snapshot_only:
+            raise LookupError("auth inspection disabled")
         from hermes_cli.auth import (
             get_nous_auth_status,
             get_codex_auth_status,
@@ -209,7 +226,7 @@ def show_status(args):
         minimax_status = {}
 
     nous_account_info = None
-    if (
+    if not snapshot_only and (
         nous_status.get("logged_in")
         or nous_status.get("access_token")
         or nous_status.get("portal_base_url")
@@ -225,19 +242,26 @@ def show_status(args):
         nous_status.get("logged_in")
         or (nous_account_info and nous_account_info.logged_in)
     )
+    nous_credential_present = bool(
+        nous_status.get("credential_present")
+        or nous_status.get("inference_credential_present")
+        or nous_logged_in
+    )
     nous_inference_present = bool(
         nous_status.get("inference_credential_present")
         or (nous_account_info and nous_account_info.inference_credential_present)
     )
     nous_error = nous_status.get("error")
-    if nous_logged_in:
+    if snapshot_only:
+        nous_label = "NOT INSPECTED"
+    elif nous_logged_in:
         nous_label = "logged in"
     elif nous_inference_present:
         nous_label = "not logged in (Nous inference key configured)"
     else:
         nous_label = "not logged in (run: hermes portal)"
     print(
-        f"  {'Nous Portal':<12}  {check_mark(nous_logged_in)} "
+        f"  {'Nous Portal':<12}  {'?' if snapshot_only else check_mark(nous_logged_in)} "
         f"{nous_label}"
     )
     portal_url = nous_status.get("portal_base_url") or "(unknown)"
@@ -262,9 +286,10 @@ def show_status(args):
         print(f"    Error:      {nous_error}")
 
     codex_logged_in = bool(codex_status.get("logged_in"))
+    codex_present = bool(codex_logged_in or codex_status.get("credential_present"))
     print(
-        f"  {'OpenAI Codex':<12}  {check_mark(codex_logged_in)} "
-        f"{'logged in' if codex_logged_in else 'not logged in (run: hermes model)'}"
+        f"  {'OpenAI Codex':<12}  {'?' if snapshot_only else check_mark(codex_present)} "
+        f"{'NOT INSPECTED' if snapshot_only else ('logged in' if codex_logged_in else 'not logged in (run: hermes model)')}"
     )
     codex_auth_file = codex_status.get("auth_store")
     if codex_auth_file:
@@ -276,9 +301,10 @@ def show_status(args):
         print(f"    Error:      {codex_status.get('error')}")
 
     qwen_logged_in = bool(qwen_status.get("logged_in"))
+    qwen_present = bool(qwen_logged_in or qwen_status.get("credential_present"))
     print(
-        f"  {'Qwen OAuth':<12}  {check_mark(qwen_logged_in)} "
-        f"{'logged in' if qwen_logged_in else 'not logged in (run: qwen auth qwen-oauth)'}"
+        f"  {'Qwen OAuth':<12}  {'?' if snapshot_only else check_mark(qwen_present)} "
+        f"{'NOT INSPECTED' if snapshot_only else ('logged in' if qwen_logged_in else 'not logged in (run: qwen auth qwen-oauth)')}"
     )
     qwen_auth_file = qwen_status.get("auth_file")
     if qwen_auth_file:
@@ -291,9 +317,10 @@ def show_status(args):
         print(f"    Error:      {qwen_status.get('error')}")
 
     minimax_logged_in = bool(minimax_status.get("logged_in"))
+    minimax_present = bool(minimax_logged_in or minimax_status.get("credential_present"))
     print(
-        f"  {'MiniMax OAuth':<12}  {check_mark(minimax_logged_in)} "
-        f"{'logged in' if minimax_logged_in else 'not logged in (run: hermes auth add minimax-oauth)'}"
+        f"  {'MiniMax OAuth':<12}  {'?' if snapshot_only else check_mark(minimax_present)} "
+        f"{'NOT INSPECTED' if snapshot_only else ('logged in' if minimax_logged_in else 'not logged in (run: hermes auth add minimax-oauth)')}"
     )
     minimax_region = minimax_status.get("region")
     if minimax_logged_in and minimax_region:
@@ -307,15 +334,19 @@ def show_status(args):
     # xAI OAuth — separate try/except so an import failure here cannot
     # disrupt the already-printed Nous/Codex/Qwen/MiniMax rows above.
     try:
-        from hermes_cli.auth import get_xai_oauth_auth_status
-        xai_oauth_status = get_xai_oauth_auth_status() or {}
+        if snapshot_only:
+            xai_oauth_status = {}
+        else:
+            from hermes_cli.auth import get_xai_oauth_auth_status
+            xai_oauth_status = get_xai_oauth_auth_status() or {}
     except Exception:
         xai_oauth_status = {}
 
     xai_oauth_logged_in = bool(xai_oauth_status.get("logged_in"))
+    xai_oauth_present = bool(xai_oauth_logged_in or xai_oauth_status.get("credential_present"))
     print(
-        f"  {'xAI OAuth':<12}  {check_mark(xai_oauth_logged_in)} "
-        f"{'logged in' if xai_oauth_logged_in else 'not logged in (run: hermes auth add xai-oauth)'}"
+        f"  {'xAI OAuth':<12}  {'?' if snapshot_only else check_mark(xai_oauth_present)} "
+        f"{'NOT INSPECTED' if snapshot_only else ('logged in' if xai_oauth_logged_in else 'not logged in (run: hermes auth add xai-oauth)')}"
     )
     xai_auth_file = xai_oauth_status.get("auth_store")
     if xai_auth_file:
@@ -328,7 +359,12 @@ def show_status(args):
     # =========================================================================
     # Nous Subscription Features
     # =========================================================================
-    if managed_nous_tools_enabled():
+    if snapshot_only:
+        print()
+        print(color("◆ Auth validation", Colors.CYAN, Colors.BOLD))
+        print("  Snapshot only: no provider calls or token refresh were attempted.")
+        print("  Run `hermes status --refresh-auth` for explicit live validation.")
+    elif managed_nous_tools_enabled():
         features = get_nous_subscription_features(config)
         print()
         print(color("◆ Nous Tool Gateway", Colors.CYAN, Colors.BOLD))
@@ -376,6 +412,9 @@ def show_status(args):
         "MiniMax (China)":  ("MINIMAX_CN_API_KEY",),
     }
     for pname, env_vars in apikey_providers.items():
+        if snapshot_only:
+            print(f"  {pname:<16} ? NOT INSPECTED")
+            continue
         key_val = ""
         for ev in env_vars:
             key_val = get_env_value(ev) or ""
@@ -388,7 +427,7 @@ def show_status(args):
     # LM Studio reachability — only probe when it's the active provider so
     # users with foreign configs don't see noise. Auth rejection vs. silent
     # empty list is the most common LM Studio support case.
-    if _effective_provider_label() == "LM Studio":
+    if not snapshot_only and _effective_provider_label() == "LM Studio":
         from hermes_cli.models import probe_lmstudio_models
         model_cfg = config.get("model")
         base = (model_cfg.get("base_url") if isinstance(model_cfg, dict) else None) or get_env_value("LM_BASE_URL") or "http://127.0.0.1:1234/v1"
@@ -426,8 +465,11 @@ def show_status(args):
         daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
         print(f"  Daytona Image: {daytona_image}")
 
-    sudo_password = os.getenv("SUDO_PASSWORD", "")
-    print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
+    if snapshot_only:
+        print("  Sudo:         ? NOT INSPECTED")
+    else:
+        sudo_password = os.getenv("SUDO_PASSWORD", "")
+        print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
 
     # =========================================================================
     # Messaging Platforms
@@ -454,6 +496,9 @@ def show_status(args):
     }
 
     for name, (token_var, home_var) in platforms.items():
+        if snapshot_only:
+            print(f"  {name:<12}  ? NOT INSPECTED")
+            continue
         token = os.getenv(token_var, "")
         has_token = bool(token)
         
@@ -471,15 +516,16 @@ def show_status(args):
         print(f"  {name:<12}  {check_mark(has_token)} {status}")
 
     # Plugin-registered platforms
-    try:
-        from gateway.platform_registry import platform_registry
-        for entry in platform_registry.plugin_entries():
-            configured = entry.check_fn()
-            status_str = "configured" if configured else "not configured"
-            label = entry.label
-            print(f"  {label:<12}  {check_mark(configured)} {status_str} (plugin)")
-    except Exception:
-        pass
+    if not snapshot_only:
+        try:
+            from gateway.platform_registry import platform_registry
+            for entry in platform_registry.plugin_entries():
+                configured = entry.check_fn()
+                status_str = "configured" if configured else "not configured"
+                label = entry.label
+                print(f"  {label:<12}  {check_mark(configured)} {status_str} (plugin)")
+        except Exception:
+            pass
 
     # =========================================================================
     # Gateway Status
@@ -563,7 +609,9 @@ def show_status(args):
         print(color("◆ Deep Checks", Colors.CYAN, Colors.BOLD))
         
         # Check OpenRouter connectivity
-        openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
+        openrouter_key = os.getenv("OPENROUTER_API_KEY", "") if refresh_auth else ""
+        if snapshot_only:
+            print("  Auth checks:  ? NOT INSPECTED (use --refresh-auth)")
         if openrouter_key:
             try:
                 import httpx

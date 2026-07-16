@@ -25,4 +25,9 @@ def build_status_parser(subparsers, *, cmd_status: Callable) -> None:
     status_parser.add_argument(
         "--deep", action="store_true", help="Run deep checks (may take longer)"
     )
+    status_parser.add_argument(
+        "--refresh-auth",
+        action="store_true",
+        help="Explicitly validate provider auth; may refresh and persist OAuth tokens",
+    )
     status_parser.set_defaults(func=cmd_status)

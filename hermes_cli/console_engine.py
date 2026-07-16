@@ -1515,7 +1515,9 @@ def _status(_engine: HermesConsoleEngine, args: list[str]) -> str:
 
     from hermes_cli.status import show_status
 
-    output = _capture_output(lambda: show_status(SimpleNamespace(all=False, deep=False)))
+    output = _capture_output(
+        lambda: show_status(SimpleNamespace(all=False, deep=False, refresh_auth=False))
+    )
     return _strip_console_status_footer(output)
 
 

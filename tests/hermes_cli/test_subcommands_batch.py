@@ -86,6 +86,15 @@ def test_single_handler_builders(name, builder, kw, argv):
     assert ns.func is handler
 
 
+def test_status_auth_refresh_is_explicit_opt_in():
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_status_parser(sub, cmd_status=_h("status"))
+
+    assert parser.parse_args(["status"]).refresh_auth is False
+    assert parser.parse_args(["status", "--refresh-auth"]).refresh_auth is True
+
+
 def test_dashboard_builder_two_handlers():
     parser = argparse.ArgumentParser(prog="hermes")
     sub = parser.add_subparsers(dest="command")

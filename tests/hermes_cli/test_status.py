@@ -75,7 +75,7 @@ def test_show_status_reports_nous_auth_error(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(auth_mod, "get_xai_oauth_auth_status", lambda: {}, raising=False)
     monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda exclude_pids=None: [], raising=False)
 
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
 
     output = capsys.readouterr().out
     assert "Nous Portal   ✗ not logged in (run: hermes portal)" in output
@@ -126,7 +126,7 @@ def test_show_status_reports_nous_inference_key_without_portal_login(monkeypatch
     monkeypatch.setattr(auth_mod, "get_xai_oauth_auth_status", lambda: {}, raising=False)
     monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda exclude_pids=None: [], raising=False)
 
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
 
     output = capsys.readouterr().out
     assert "Nous Portal   ✗ not logged in (Nous inference key configured)" in output
@@ -158,6 +158,54 @@ def _base_xai_mocks(monkeypatch, tmp_path):
     return status_mod
 
 
+def test_cli_status_snapshot_mode_never_calls_runtime_auth(monkeypatch, capsys, tmp_path):
+    status_mod = _base_xai_mocks(monkeypatch, tmp_path)
+    import hermes_cli.auth as auth_mod
+    import agent.credential_pool as credential_pool
+
+    auth_file = tmp_path / "auth.json"
+    env_file = tmp_path / ".env"
+    auth_file.write_bytes(b'{"token":"opaque"}\n')
+    env_file.write_bytes(b"OPENAI_API_KEY=opaque\n")
+    def file_snapshot():
+        return {
+            str(path.relative_to(tmp_path)): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in tmp_path.rglob("*") if path.is_file()
+        }
+
+    before = file_snapshot()
+
+    def unexpected_runtime_auth(*_args, **_kwargs):
+        raise AssertionError("snapshot status must not inspect or refresh auth")
+
+    for name in (
+        "get_provider_auth_state",
+        "get_anthropic_key",
+        "_read_qwen_cli_tokens",
+        "get_nous_auth_status",
+        "get_codex_auth_status",
+        "get_qwen_auth_status",
+        "get_minimax_oauth_auth_status",
+        "get_xai_oauth_auth_status",
+    ):
+        monkeypatch.setattr(auth_mod, name, unexpected_runtime_auth, raising=False)
+    monkeypatch.setattr(credential_pool, "load_pool", unexpected_runtime_auth)
+    monkeypatch.setattr(status_mod, "get_env_value", unexpected_runtime_auth)
+    monkeypatch.setattr(status_mod, "load_config", unexpected_runtime_auth)
+    monkeypatch.setattr(status_mod, "resolve_requested_provider", unexpected_runtime_auth)
+    monkeypatch.setattr(status_mod, "resolve_provider", unexpected_runtime_auth)
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=False))
+
+    output = capsys.readouterr().out
+    after = file_snapshot()
+    assert after == before
+    assert output.count("NOT INSPECTED") >= 10
+    assert "Model:        NOT INSPECTED" in output
+    assert "Provider:     unknown (auth not inspected)" in output
+    assert "Snapshot only: no provider calls or token refresh were attempted." in output
+
+
 def test_show_status_all_redacts_api_keys(monkeypatch, capsys, tmp_path):
     import hermes_cli.auth as auth_mod
 
@@ -172,7 +220,7 @@ def test_show_status_all_redacts_api_keys(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(status_mod, "get_env_value", lambda name: env_values.get(name, ""), raising=False)
     monkeypatch.setattr(auth_mod, "get_anthropic_key", lambda: anthropic_key, raising=False)
 
-    status_mod.show_status(SimpleNamespace(all=True, deep=False))
+    status_mod.show_status(SimpleNamespace(all=True, deep=False, refresh_auth=True))
 
     out = capsys.readouterr().out
     assert "OpenAI" in out
@@ -195,7 +243,7 @@ class TestShowStatusXaiOAuth:
                             lambda: {"logged_in": True, "auth_store": "/a/auth.json"},
                             raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         assert "xAI OAuth" in out
@@ -210,7 +258,7 @@ class TestShowStatusXaiOAuth:
                             lambda: {"logged_in": True, "auth_store": "/home/u/.hermes/auth.json"},
                             raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         assert "Auth file:  /home/u/.hermes/auth.json" in out
@@ -226,7 +274,7 @@ class TestShowStatusXaiOAuth:
                             },
                             raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         assert "Refreshed:" in out
@@ -243,7 +291,7 @@ class TestShowStatusXaiOAuth:
                             },
                             raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         xai_section = out.split("xAI OAuth", 1)[1]
@@ -257,7 +305,7 @@ class TestShowStatusXaiOAuth:
                             lambda: {"logged_in": True},
                             raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         xai_section = out.split("xAI OAuth", 1)[1].split("◆", 1)[0]
@@ -271,7 +319,7 @@ class TestShowStatusXaiOAuth:
                             lambda: {"logged_in": True, "auth_store": "/a/auth.json"},
                             raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         xai_section = out.split("xAI OAuth", 1)[1].split("◆", 1)[0]
@@ -288,7 +336,7 @@ class TestShowStatusXaiOAuth:
                             lambda: {"logged_in": False, "error": "no credentials"},
                             raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         assert "not logged in (run: hermes auth add xai-oauth)" in out
@@ -300,7 +348,7 @@ class TestShowStatusXaiOAuth:
                             lambda: {"logged_in": False, "error": "Token has expired"},
                             raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         assert "Error:      Token has expired" in out
@@ -313,7 +361,7 @@ class TestShowStatusXaiOAuth:
                             lambda: {"logged_in": False},
                             raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         xai_section = out.split("xAI OAuth", 1)[1].split("◆", 1)[0]
@@ -329,7 +377,7 @@ class TestShowStatusXaiOAuth:
         status_mod = _base_xai_mocks(monkeypatch, tmp_path)
         monkeypatch.delattr(auth_mod, "get_xai_oauth_auth_status", raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         assert "◆ Auth Providers" in out
@@ -342,7 +390,7 @@ class TestShowStatusXaiOAuth:
                             lambda: {"logged_in": True}, raising=False)
         monkeypatch.delattr(auth_mod, "get_xai_oauth_auth_status", raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         assert "Nous Portal" in out
@@ -358,7 +406,7 @@ class TestShowStatusXaiOAuth:
 
         monkeypatch.setattr(auth_mod, "get_xai_oauth_auth_status", _raises, raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         assert "◆ Auth Providers" in out
@@ -370,7 +418,7 @@ class TestShowStatusXaiOAuth:
         monkeypatch.setattr(auth_mod, "get_xai_oauth_auth_status",
                             lambda: None, raising=False)
 
-        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
         out = capsys.readouterr().out
 
         assert "xAI OAuth" in out
