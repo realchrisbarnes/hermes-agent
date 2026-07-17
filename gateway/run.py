@@ -6703,12 +6703,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # gateway lazily imports run_agent inside per-request handlers,
         # so the discover_plugins() side-effect in model_tools.py is NOT
         # guaranteed to have run by the time we reach this point.
+        plugin_inventory = []
         try:
-            from hermes_cli.plugins import discover_plugins
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
             discover_plugins()
+            plugin_inventory = get_plugin_manager().list_plugins()
         except Exception:
             logger.warning(
                 "plugin discovery failed at gateway startup", exc_info=True,
+            )
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(plugin_inventory=plugin_inventory)
+        except Exception:
+            logger.warning(
+                "plugin inventory receipt failed at gateway startup", exc_info=True,
             )
 
         # Register the generic relay adapter when a connector relay URL is

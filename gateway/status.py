@@ -753,6 +753,7 @@ def write_runtime_status(
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
     served_profiles: Any = _UNSET,
+    plugin_inventory: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -778,6 +779,37 @@ def write_runtime_status(
         # for a single-profile gateway. Lets `hermes status` show per-profile
         # coverage without a second probe.
         payload["served_profiles"] = list(served_profiles or [])
+    if plugin_inventory is not _UNSET:
+        # Persist only the non-secret fields needed to bind plugin discovery to
+        # this live gateway PID. Config, descriptions, errors, and requirements
+        # are intentionally excluded from the runtime receipt.
+        sanitized_plugins = []
+        for item in plugin_inventory if isinstance(plugin_inventory, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            key = item.get("key")
+            tools = item.get("tools")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if not isinstance(key, str) or not key.strip():
+                key = name
+            if isinstance(tools, bool):
+                tools = 0
+            try:
+                tool_count = max(0, int(tools))
+            except (TypeError, ValueError):
+                tool_count = 0
+            sanitized_plugins.append({
+                "name": name,
+                "key": key,
+                "enabled": item.get("enabled") is True,
+                "tools": tool_count,
+            })
+        payload["plugin_inventory"] = sorted(
+            sanitized_plugins,
+            key=lambda item: (item["key"], item["name"]),
+        )
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})

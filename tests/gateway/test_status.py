@@ -360,6 +360,34 @@ class TestGatewayRuntimeStatus:
         assert payload["pid"] == os.getpid()
         assert payload["start_time"] == 2000
 
+    def test_write_runtime_status_records_sanitized_plugin_inventory(self, tmp_path, monkeypatch):
+        """The live gateway receipt identifies enabled plugins without config data."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            gateway_state="running",
+            plugin_inventory=[
+                {
+                    "name": "bella_agent_native",
+                    "key": "bella_agent_native",
+                    "enabled": True,
+                    "tools": 59,
+                    "error": "must not persist",
+                    "description": "must not persist",
+                }
+            ],
+        )
+
+        payload = status.read_runtime_status()
+        assert payload["plugin_inventory"] == [
+            {
+                "name": "bella_agent_native",
+                "key": "bella_agent_native",
+                "enabled": True,
+                "tools": 59,
+            }
+        ]
+
     def test_runtime_status_running_pid_rejects_stale_record_for_supervisor_pid(self, monkeypatch):
         """Regression: stale profile runtime state must not mark s6 supervisors live.
 
