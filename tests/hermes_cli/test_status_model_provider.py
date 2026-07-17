@@ -41,7 +41,7 @@ def test_show_status_displays_configured_dict_model_and_provider_label(monkeypat
     monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "anthropic", raising=False)
     monkeypatch.setattr(status_mod, "provider_label", lambda provider: "Anthropic", raising=False)
 
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
 
     out = capsys.readouterr().out
     assert "Model:        anthropic/claude-sonnet-4" in out
@@ -57,7 +57,7 @@ def test_show_status_displays_legacy_string_model_and_custom_endpoint(monkeypatc
     monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "openrouter", raising=False)
     monkeypatch.setattr(status_mod, "provider_label", lambda provider: "Custom endpoint" if provider == "custom" else provider, raising=False)
 
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
 
     out = capsys.readouterr().out
     assert "Model:        qwen3:latest" in out
@@ -98,7 +98,7 @@ def test_show_status_reports_managed_nous_features(monkeypatch, capsys, tmp_path
         raising=False,
     )
 
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
 
     out = capsys.readouterr().out
     assert "Nous Tool Gateway" in out
@@ -121,7 +121,7 @@ def test_show_status_hides_nous_subscription_section_when_feature_flag_is_off(mo
     monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "nous", raising=False)
     monkeypatch.setattr(status_mod, "provider_label", lambda provider: "Nous Portal", raising=False)
 
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
 
     out = capsys.readouterr().out
     assert "Nous Tool Gateway" not in out
@@ -171,7 +171,7 @@ def test_show_status_reports_exhausted_nous_credits(monkeypatch, capsys, tmp_pat
     monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "nous", raising=False)
     monkeypatch.setattr(status_mod, "provider_label", lambda provider: "Nous Portal", raising=False)
 
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
 
     out = capsys.readouterr().out
     assert "Nous Tool Gateway" in out
@@ -204,7 +204,7 @@ def test_show_status_reports_empty_lmstudio_listing_as_reachable(monkeypatch, ca
         lambda api_key=None, base_url=None, timeout=5.0: [],
     )
 
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    status_mod.show_status(SimpleNamespace(all=False, deep=False, refresh_auth=True))
 
     out = capsys.readouterr().out
     assert "LM Studio" in out
