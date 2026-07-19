@@ -16,7 +16,7 @@ const OVERLAY_FALLBACK_WIDTH = 144
  *
  * @param {{ isWindows?: boolean, isWsl?: boolean, isMac?: boolean }} opts
  */
-function nativeOverlayWidth({ isWindows = false, isWsl = false, isMac = false } = {}) {
+function nativeOverlayWidth({ isMac = false } = {}) {
   if (isMac) return 0
   return OVERLAY_FALLBACK_WIDTH
 }

@@ -43,6 +43,7 @@ export function NodeContextMenu({ onChanged, onClose, target }: NodeContextMenuP
 
     setLoading(true)
     setError(null)
+
     try {
       const detail = await getLearningNode(target.id)
       setEditing({ content: detail.content, id: target.id, label: target.label })
@@ -61,11 +62,14 @@ export function NodeContextMenu({ onChanged, onClose, target }: NodeContextMenuP
 
     setSaving(true)
     setError(null)
+
     try {
       const res = await editLearningNode(editing.id, editing.content)
+
       if (!res.ok) {
         throw new Error(res.message)
       }
+
       setEditing(null)
       onChanged()
     } catch (e) {
@@ -146,9 +150,11 @@ export function NodeContextMenu({ onChanged, onClose, target }: NodeContextMenuP
           }
 
           const res = await deleteLearningNode(deleting.id)
+
           if (!res.ok) {
             throw new Error(res.message)
           }
+
           onChanged()
         }}
         open={Boolean(deleting)}
