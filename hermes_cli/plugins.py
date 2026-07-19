@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
@@ -77,6 +78,43 @@ class PluginToolOverrideError(PermissionError):
 
 
 logger = logging.getLogger(__name__)
+
+_RUNTIME_PROOF_SOURCE_FILES = ("__init__.py", "installation.json", "plugin.yaml")
+
+
+def _runtime_plugin_source_sha256(path: Union[Path, str]) -> Dict[str, str]:
+    """Hash only the non-secret files needed to identify loaded plugin code."""
+    result: Dict[str, str] = {}
+    root = Path(path)
+    for name in _RUNTIME_PROOF_SOURCE_FILES:
+        candidate = root / name
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        try:
+            result[name] = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return result
+
+
+def _runtime_plugin_dependency_sha256(module: Optional[types.ModuleType]) -> Dict[str, str]:
+    """Copy plugin-computed, non-secret dependency identities into runtime proof."""
+    declared = getattr(module, "RUNTIME_PROOF_DEPENDENCY_SHA256", None) if module else None
+    if not isinstance(declared, dict) and module is not None:
+        delegated = getattr(module, "MODULE", None)
+        declared = getattr(delegated, "RUNTIME_PROOF_DEPENDENCY_SHA256", None)
+    if not isinstance(declared, dict):
+        return {}
+    result: Dict[str, str] = {}
+    for name, digest in declared.items():
+        if (
+            isinstance(name, str) and 0 < len(name) <= 128
+            and Path(name).name == name
+            and isinstance(digest, str) and len(digest) == 64
+            and all(char in "0123456789abcdefABCDEF" for char in digest)
+        ):
+            result[name] = digest.lower()
+    return dict(sorted(result.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -1932,26 +1970,31 @@ class PluginManager:
     # Introspection
     # -----------------------------------------------------------------------
 
-    def list_plugins(self) -> List[Dict[str, Any]]:
-        """Return a list of info dicts for all discovered plugins."""
+    def list_plugins(self, *, include_runtime_proof: bool = False) -> List[Dict[str, Any]]:
+        """Return plugin info, with optional non-secret runtime proof fields."""
         result: List[Dict[str, Any]] = []
         for key, loaded in sorted(self._plugins.items()):
-            result.append(
-                {
-                    "name": loaded.manifest.name,
-                    "key": loaded.manifest.key or loaded.manifest.name,
-                    "kind": loaded.manifest.kind,
-                    "version": loaded.manifest.version,
-                    "description": loaded.manifest.description,
-                    "source": loaded.manifest.source,
-                    "enabled": loaded.enabled,
-                    "tools": len(loaded.tools_registered),
-                    "hooks": len(loaded.hooks_registered),
-                    "middleware": len(loaded.middleware_registered),
-                    "commands": len(loaded.commands_registered),
-                    "error": loaded.error,
-                }
-            )
+            info = {
+                "name": loaded.manifest.name,
+                "key": loaded.manifest.key or loaded.manifest.name,
+                "kind": loaded.manifest.kind,
+                "version": loaded.manifest.version,
+                "description": loaded.manifest.description,
+                "source": loaded.manifest.source,
+                "enabled": loaded.enabled,
+                "tools": len(loaded.tools_registered),
+                "hooks": len(loaded.hooks_registered),
+                "middleware": len(loaded.middleware_registered),
+                "commands": len(loaded.commands_registered),
+                "error": loaded.error,
+            }
+            if include_runtime_proof:
+                info["tool_names"] = sorted(set(loaded.tools_registered))
+                info["source_sha256"] = _runtime_plugin_source_sha256(loaded.manifest.path)
+                dependencies = _runtime_plugin_dependency_sha256(loaded.module)
+                if dependencies:
+                    info["dependency_sha256"] = dependencies
+            result.append(info)
         return result
 
     # -----------------------------------------------------------------------

@@ -1,5 +1,6 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
+import hashlib
 import logging
 import sys
 import types
@@ -1468,6 +1469,80 @@ class TestPluginManagerList:
             assert "enabled" in p
             assert "tools" in p
             assert "hooks" in p
+
+    def test_runtime_plugin_inventory_has_exact_tools_and_allowlisted_source_hashes(
+        self, tmp_path, monkeypatch,
+    ):
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = _make_plugin_dir(
+            plugins_dir, "proof_plugin",
+            register_body='ctx.register_tool("proof_tool", "proof", {}, lambda **kw: "{}")',
+        )
+        (plugin_dir / "installation.json").write_text('{"enabled":true}', encoding="utf-8")
+        (plugin_dir / "private.txt").write_text("must not hash", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        row = next(p for p in mgr.list_plugins(include_runtime_proof=True) if p["name"] == "proof_plugin")
+        assert row["tool_names"] == ["proof_tool"]
+        assert set(row["source_sha256"]) == {"__init__.py", "installation.json", "plugin.yaml"}
+        assert row["source_sha256"] == {
+            name: hashlib.sha256((plugin_dir / name).read_bytes()).hexdigest()
+            for name in ("__init__.py", "installation.json", "plugin.yaml")
+        }
+        public = next(p for p in mgr.list_plugins() if p["name"] == "proof_plugin")
+        assert "tool_names" not in public
+        assert "source_sha256" not in public
+
+    def test_runtime_plugin_inventory_includes_declared_dependency_hashes_only(
+        self, tmp_path, monkeypatch,
+    ):
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = _make_plugin_dir(plugins_dir, "dependency_proof_plugin")
+        (plugin_dir / "__init__.py").write_text(
+            "RUNTIME_PROOF_DEPENDENCY_SHA256 = {\n"
+            "    'agent_native_contract.py': 'A' * 64,\n"
+            "    '../unsafe': 'b' * 64,\n"
+            "    'bad': 'not-a-digest',\n"
+            "}\n"
+            "def register(ctx):\n    pass\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        row = next(
+            p for p in mgr.list_plugins(include_runtime_proof=True)
+            if p["name"] == "dependency_proof_plugin"
+        )
+        assert row["dependency_sha256"] == {"agent_native_contract.py": "a" * 64}
+
+    def test_runtime_plugin_inventory_reads_dependency_hash_from_installed_adapter(
+        self, tmp_path, monkeypatch,
+    ):
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = _make_plugin_dir(plugins_dir, "adapter_proof_plugin")
+        (plugin_dir / "__init__.py").write_text(
+            "class TrackedPlugin:\n"
+            "    RUNTIME_PROOF_DEPENDENCY_SHA256 = {'agent_native_contract.py': 'b' * 64}\n"
+            "MODULE = TrackedPlugin()\n"
+            "def register(ctx):\n    pass\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        row = next(
+            p for p in mgr.list_plugins(include_runtime_proof=True)
+            if p["name"] == "adapter_proof_plugin"
+        )
+        assert row["dependency_sha256"] == {"agent_native_contract.py": "b" * 64}
 
     def test_shared_hook_name_credited_to_every_plugin(self, tmp_path, monkeypatch):
         """Two plugins registering the SAME hook name are each credited.

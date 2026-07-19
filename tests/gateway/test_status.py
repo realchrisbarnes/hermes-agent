@@ -372,6 +372,17 @@ class TestGatewayRuntimeStatus:
                     "key": "bella_agent_native",
                     "enabled": True,
                     "tools": 59,
+                    "tool_names": ["z_tool", "a_tool", "a_tool"],
+                    "source_sha256": {
+                        "plugin.yaml": "a" * 64,
+                        "__init__.py": "b" * 64,
+                        "private.txt": "c" * 64,
+                    },
+                    "dependency_sha256": {
+                        "agent_native_contract.py": "d" * 64,
+                        "other-contract.json": "e" * 64,
+                        "../unsafe": "f" * 64,
+                    },
                     "error": "must not persist",
                     "description": "must not persist",
                 }
@@ -385,6 +396,15 @@ class TestGatewayRuntimeStatus:
                 "key": "bella_agent_native",
                 "enabled": True,
                 "tools": 59,
+                "tool_names": ["a_tool", "z_tool"],
+                "source_sha256": {
+                    "__init__.py": "b" * 64,
+                    "plugin.yaml": "a" * 64,
+                },
+                "dependency_sha256": {
+                    "agent_native_contract.py": "d" * 64,
+                    "other-contract.json": "e" * 64,
+                },
             }
         ]
 

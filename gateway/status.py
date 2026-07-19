@@ -800,12 +800,46 @@ def write_runtime_status(
                 tool_count = max(0, int(tools))
             except (TypeError, ValueError):
                 tool_count = 0
-            sanitized_plugins.append({
+            sanitized = {
                 "name": name,
                 "key": key,
                 "enabled": item.get("enabled") is True,
                 "tools": tool_count,
-            })
+            }
+            tool_names = item.get("tool_names")
+            if isinstance(tool_names, list):
+                sanitized["tool_names"] = sorted({
+                    tool_name.strip()
+                    for tool_name in tool_names
+                    if isinstance(tool_name, str) and 0 < len(tool_name.strip()) <= 160
+                })
+            source_sha256 = item.get("source_sha256")
+            if isinstance(source_sha256, dict):
+                allowed_sources = {"__init__.py", "installation.json", "plugin.yaml"}
+                sanitized["source_sha256"] = {
+                    source_name: digest.lower()
+                    for source_name, digest in sorted(source_sha256.items())
+                    if source_name in allowed_sources
+                    and isinstance(digest, str) and len(digest) == 64
+                    and all(char in "0123456789abcdefABCDEF" for char in digest)
+                }
+            dependency_sha256 = item.get("dependency_sha256")
+            if isinstance(dependency_sha256, dict):
+                dependencies = {}
+                for source_name, digest in sorted(dependency_sha256.items()):
+                    if len(dependencies) >= 16:
+                        break
+                    if (
+                        isinstance(source_name, str) and 0 < len(source_name) <= 128
+                        and source_name not in {".", ".."}
+                        and all(char.isalnum() or char in "._-" for char in source_name)
+                        and isinstance(digest, str) and len(digest) == 64
+                        and all(char in "0123456789abcdefABCDEF" for char in digest)
+                    ):
+                        dependencies[source_name] = digest.lower()
+                if dependencies:
+                    sanitized["dependency_sha256"] = dependencies
+            sanitized_plugins.append(sanitized)
         payload["plugin_inventory"] = sorted(
             sanitized_plugins,
             key=lambda item: (item["key"], item["name"]),
