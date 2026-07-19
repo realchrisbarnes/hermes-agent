@@ -1,9 +1,22 @@
+import os
 import socket
 import shutil
 import subprocess
 import sys
+from unittest.mock import patch
 
 import pytest
+
+
+def test_clear_environment_patch_preserves_isolated_hermes_home(monkeypatch):
+    isolated_home = os.environ["HERMES_HOME"]
+    monkeypatch.setenv("SHOULD_BE_CLEARED", "yes")
+
+    with patch.dict(os.environ, {}, clear=True):
+        assert os.environ["HERMES_HOME"] == isolated_home
+        assert "SHOULD_BE_CLEARED" not in os.environ
+
+    assert os.environ["HERMES_HOME"] == isolated_home
 
 
 @pytest.mark.parametrize("command", [

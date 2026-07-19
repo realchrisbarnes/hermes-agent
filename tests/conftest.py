@@ -368,6 +368,19 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # unittest.mock.patch.dict(..., clear=True) calls os.environ.clear()
+    # after this fixture has established the per-test home. Without this
+    # guard, gateway adapter tests silently fall back to the real ~/.hermes
+    # and can overwrite live gateway_state.json. Preserve only the isolation
+    # root; patch.dict still clears every other variable requested by the test.
+    environ_clear = os.environ.clear
+
+    def clear_environment_preserving_test_home():
+        test_home = os.environ.get("HERMES_HOME", str(fake_hermes_home))
+        environ_clear()
+        os.environ["HERMES_HOME"] = test_home
+
+    monkeypatch.setattr(os.environ, "clear", clear_environment_preserving_test_home)
     # Credential env vars are scrubbed above, but macOS Keychain credentials
     # live outside the process environment. Keep normal tests hermetic; the
     # focused keychain tests opt back in with mocked subprocess responses.
