@@ -3893,10 +3893,14 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        events_emitted = 0
+
         class _SlowAliveCreateStream:
             def __iter__(self):
+                nonlocal events_emitted
                 for _ in range(5):
                     time.sleep(0.03)
+                    events_emitted += 1
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -3908,14 +3912,17 @@ class TestCodexAuxiliaryAdapterTimeout:
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        # Assert the behavioral contract instead of a scheduler-sensitive
+        # wall-clock ceiling. Without total-timeout enforcement the fake
+        # stream emits all five events; with enforcement it is interrupted at
+        # an event boundary before completion even on a heavily loaded host.
+        assert events_emitted < 5
 
 
 class TestCodexAuxiliaryToolMessageConversion:

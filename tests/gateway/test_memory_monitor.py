@@ -89,9 +89,20 @@ def test_stop_without_start_is_noop():
 
 def test_periodic_timer_fires(caplog):
     caplog.set_level(logging.INFO, logger="gateway.memory_monitor")
-    # Short interval so we can observe multiple ticks inside the test budget.
+    # Short interval so we can observe multiple ticks. Poll for the behavior
+    # instead of assuming the scheduler will deliver three ticks inside a
+    # fixed 450ms sleep while the full parallel suite is under load.
     mm.start_memory_monitoring(interval_seconds=0.1)
-    time.sleep(0.45)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        periodic = [
+            r for r in caplog.records
+            if r.getMessage().startswith("[MEMORY] rss=")
+            or r.getMessage().startswith("[MEMORY] rss=unavailable")
+        ]
+        if len(periodic) >= 3:
+            break
+        time.sleep(0.02)
     mm.stop_memory_monitoring(timeout=1.0)
 
     periodic = [

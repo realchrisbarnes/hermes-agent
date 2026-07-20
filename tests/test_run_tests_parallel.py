@@ -225,6 +225,54 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only fd limit probe")
+def test_runner_raises_low_inherited_file_descriptor_limit(tmp_path: Path) -> None:
+    """A launchd-style 256-FD limit must not break large isolated test files."""
+    import resource
+
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    (probe_dir / "test_fd_limit.py").write_text(
+        "import os\n\n"
+        "def test_can_open_many_descriptors():\n"
+        "    handles = []\n"
+        "    try:\n"
+        "        handles = [open(os.devnull) for _ in range(300)]\n"
+        "        assert len(handles) == 300\n"
+        "    finally:\n"
+        "        for handle in handles:\n"
+        "            handle.close()\n"
+    )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+    def _launchd_limit() -> None:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+        preexec_fn=_launchd_limit,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+
+
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
     """A bare ``-q`` (no ``--``) runs clean instead of erroring out."""
     probe_dir = _make_probe_dir(tmp_path)

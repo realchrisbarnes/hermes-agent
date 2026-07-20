@@ -90,6 +90,35 @@ _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 # CI jobs by estimated total time, so no one job gets all the slow files.
 _DURATIONS_FILE = "test_durations.json"
 
+# macOS LaunchAgents commonly inherit a 256-descriptor soft limit even when
+# the interactive shell is configured much higher. Large isolated test files
+# legitimately cross that threshold while creating event loops and local test
+# sockets, then pytest itself cannot open its temp directory during teardown.
+# Normalize the runner process before it spawns per-file children so scheduled
+# and interactive runs exercise the same environment.
+_MIN_NOFILE_SOFT_LIMIT = 4096
+
+
+def _raise_inherited_file_descriptor_limit() -> int | None:
+    """Raise a low POSIX soft FD limit up to a bounded test-safe value."""
+    if sys.platform == "win32":
+        return None
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = _MIN_NOFILE_SOFT_LIMIT
+        if hard != resource.RLIM_INFINITY:
+            target = min(target, hard)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            return target
+        return soft
+    except (ImportError, OSError, ValueError):
+        # Some constrained containers do not permit a soft-limit increase.
+        # Keep the runner usable there; its normal test verdict remains honest.
+        return None
+
 
 def _approximately_count_tests(
     files: List[Path], repo_root: Path
@@ -592,6 +621,8 @@ def _slice_files(
 
 
 def main() -> int:
+    _raise_inherited_file_descriptor_limit()
+
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
