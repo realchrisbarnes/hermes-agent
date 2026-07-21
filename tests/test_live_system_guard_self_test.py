@@ -58,6 +58,43 @@ def test_os_killpg_blocks_foreign_pgid():
         os.killpg(FOREIGN_PID, signal.SIGTERM)
 
 
+def test_os_kill_allows_own_child_reaped_mid_walk(monkeypatch):
+    """A dead own-child must stay killable even if reaped mid-guard-check.
+
+    Race pinned by tests/agent/lsp/test_client_e2e.py flakes: the LSP
+    client's server exits after the ``exit`` notification, asyncio's
+    child watcher reaps it in a side thread, and ``proc.terminate()``
+    lands while the guard is mid-walk — ``psutil.Process(pid)``
+    succeeded on the zombie, then ``parents()`` raises NoSuchProcess.
+    A stale PID means the kill is a no-op, so the guard must allow it
+    (matching its construction-time stale-PID branch), not block it.
+    """
+    import psutil
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()  # exited AND reaped -> stale PID
+    stale_pid = child.pid
+
+    class ReapedMidWalk:
+        """Simulates: construction saw the zombie, walk saw nothing."""
+
+        def __init__(self, pid):
+            self.pid = pid
+
+        def parents(self):
+            raise psutil.NoSuchProcess(self.pid)
+
+    monkeypatch.setattr(psutil, "Process", ReapedMidWalk)
+
+    # Signal 0 = existence probe, harmless even under PID reuse. The
+    # guard must let it through to the real os.kill (which then raises
+    # ProcessLookupError for the stale PID) instead of RuntimeError.
+    try:
+        os.kill(stale_pid, 0)
+    except ProcessLookupError:
+        pass
+
+
 # ──────────────────── subprocess regex bypasses ────────────────
 
 

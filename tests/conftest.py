@@ -871,6 +871,12 @@ def _live_system_guard(request, monkeypatch, _unit_external_effect_guard):
             for parent in walker.parents():
                 if parent.pid == test_pid:
                     return True
+        except _psutil.NoSuchProcess:
+            # PID vanished between Process() construction and the
+            # parents() walk (e.g. asyncio's child watcher reaped an
+            # exited own-child in its side thread). Stale PID — kill
+            # is a no-op, same as the construction-time branch above.
+            return True
         except Exception:
             return False
         return False
